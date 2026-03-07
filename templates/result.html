@@ -1,0 +1,207 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Invoice Extraction Result</title>
+    <link href="https://fonts.googleapis.com/css2?family=Roboto:wght@400;700&display=swap" rel="stylesheet">
+    <link rel="icon" href="{{ url_for('static', filename='logos/ai infinite.jpg') }}" type="image/x-icon">
+    <style>
+        /* Basic Reset */
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        /* Body Styling */
+        body {
+            font-family: 'Roboto', sans-serif;
+            background-color: #f0f4f8;
+            color: #333;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            min-height: 100vh;
+        }
+
+        /* Main Container */
+        .container {
+            background-color: #fff;
+            padding: 40px;
+            border-radius: 10px;
+            box-shadow: 0 4px 8px rgba(0, 0, 0, 0.1);
+            width: 100%;
+            max-width: 900px;
+            text-align: center;
+        }
+
+        /* Header Styling */
+        h2 {
+            font-size: 32px;
+            font-weight: 700;
+            margin-bottom: 10px;
+            color: #1a73e8;
+        }
+
+        p.subtitle {
+            font-size: 16px;
+            color: #666;
+            margin-bottom: 20px;
+        }
+
+        /* Invoice Data Display */
+        .invoice-data {
+            background-color: #f8f9fa;
+            border-radius: 8px;
+            padding: 20px;
+            box-shadow: 0 2px 6px rgba(0, 0, 0, 0.1);
+            text-align: left;
+            white-space: pre-wrap;
+            word-wrap: break-word;
+            max-height: 400px;
+            overflow-y: auto;
+            margin-bottom: 20px;
+            border: 1px solid #e0e0e0;
+        }
+
+        pre {
+            font-family: 'Courier New', Courier, monospace;
+            color: #343a40;
+            font-size: 16px;
+            line-height: 1.5;
+        }
+
+        /* Links */
+        a {
+            text-decoration: none;
+            color: #007bff;
+            font-size: 16px;
+        }
+
+        a:hover {
+            text-decoration: underline;
+        }
+
+        /* Button Styling */
+        .button-container {
+            margin-top: 20px;
+            display: flex;
+            justify-content: center;
+            gap: 15px;
+            flex-wrap: wrap;
+        }
+
+        .btn {
+            padding: 12px 20px;
+            font-size: 18px;
+            background-color: #1a73e8;
+            color: white;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+            transition: background-color 0.3s ease;
+        }
+
+        .btn:hover {
+            background-color: #0d47a1;
+        }
+
+        .btn-secondary {
+            background-color: #34a853;
+        }
+
+        .btn-secondary:hover {
+            background-color: #2e8b45;
+        }
+
+        .btn-copy {
+            background-color: #ff9800;
+        }
+
+        .btn-copy:hover {
+            background-color: #fb8c00;
+        }
+
+        /* File Format Selection */
+        .select-container {
+            margin-top: 20px;
+        }
+
+        .file-select {
+            padding: 10px;
+            font-size: 16px;
+            background-color: #f8f9fa;
+            border: 1px solid #ccc;
+            border-radius: 5px;
+            width: 200px;
+        }
+
+        /* Animation */
+        @keyframes fadeIn {
+            from { opacity: 0; }
+            to { opacity: 1; }
+        }
+
+        .container {
+            animation: fadeIn 0.5s ease-in;
+        }
+    </style>
+</head>
+<body>
+
+    <div class="container">
+        <h2>Invoice Data Extraction Result</h2>
+        <p class="subtitle">Your invoice has been successfully processed. Review the extracted data below.</p>
+
+        <!-- Displaying extracted invoice data -->
+        <div class="invoice-data">
+            <pre id="json-output">{{ json_data }}</pre>
+        </div>
+
+        <!-- File format selection -->
+        <div class="select-container">
+            <label for="file-format" class="font-semibold">Select file format for download:</label><br>
+            <select id="file-format" class="file-select">
+                <option value="json">JSON</option>
+                <option value="excel">Excel</option>
+            </select>
+        </div>
+
+        <!-- Button actions -->
+        <div class="button-container">
+            <!-- Back to Upload Page -->
+            <a href="{{ url_for('dashboard') }}" class="btn">Back to Upload</a>
+
+            <!-- Download JSON or Excel -->
+            <form action="{{ url_for('download_file') }}" method="POST" style="display:inline;">
+                <textarea name="json_data" style="display:none;">{{ json_data }}</textarea>
+                <input type="hidden" name="file_format" id="file-format-input">
+                <button type="submit" class="btn btn-secondary">Download File</button>
+            </form>
+
+            <!-- Copy JSON -->
+            <button onclick="copyToClipboard()" class="btn btn-copy">Copy JSON</button>
+        </div>
+    </div>
+
+    <script>
+        // Function to copy JSON to clipboard
+        function copyToClipboard() {
+            const jsonOutput = document.getElementById("json-output").innerText;
+            navigator.clipboard.writeText(jsonOutput).then(() => {
+                alert("JSON copied to clipboard!");
+            }).catch(err => {
+                console.error("Failed to copy JSON: ", err);
+            });
+        }
+
+        // Update the file format input before submitting the form
+        document.querySelector("form").onsubmit = function () {
+            const selectedFormat = document.getElementById("file-format").value;
+            document.getElementById("file-format-input").value = selectedFormat;
+        };
+    </script>
+
+</body>
+</html>
