@@ -1,0 +1,1985 @@
+from dotenv import load_dotenv
+from prompts import input_prompt
+load_dotenv()
+import re
+import io
+import json
+import os
+from datetime import datetime, timedelta
+import unicodedata
+import secrets
+import time
+import bcrypt
+import fitz
+from flask import (
+    Flask,
+    flash,
+    redirect,
+    render_template,
+    request,
+    jsonify,
+    send_file,
+    session,
+    url_for,
+    send_from_directory,
+)
+import pandas as pd
+from werkzeug.utils import secure_filename
+from PIL import Image
+import google.generativeai as genai
+import logging
+from functools import wraps
+from flask_cors import CORS
+from werkzeug.security import check_password_hash, generate_password_hash
+import ssl
+import mysql.connector
+from mysql.connector import pooling
+from datetime import timedelta
+utc_now = datetime.utcnow()
+import vertexai
+from vertexai.preview.generative_models import GenerativeModel
+from pdf2image import convert_from_path
+from vertexai.preview.generative_models import Part
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
+
+# ================================================================
+# ✅ UTILITY — normalize unicode to plain ASCII
+# ================================================================
+def normalize_text(value):
+    """Convert unicode characters to closest ASCII. ä→a, é→e, ü→u"""
+    if not value or not isinstance(value, str):
+        return value
+    normalized = unicodedata.normalize("NFKD", value)
+    return normalized.encode("ascii", "ignore").decode("ascii").strip()
+
+
+app = Flask(__name__)
+from zoneinfo import ZoneInfo
+
+# Configure the Google Gemini API
+genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
+
+# Initialize the Gemini model
+model = genai.GenerativeModel("gemini-1.5-pro")
+
+
+# ================================================================
+# ✅ CELERY QUEUE SETUP — handles 50+ concurrent invoice requests
+# ================================================================
+from celery import Celery
+
+def make_celery(flask_app):
+    celery_app = Celery(
+        flask_app.import_name,
+        broker=os.getenv("REDIS_URL", "redis://localhost:6379/0"),
+        backend=os.getenv("REDIS_URL", "redis://localhost:6379/0"),
+    )
+    celery_app.conf.update(
+        task_serializer="json",
+        result_serializer="json",
+        accept_content=["json"],
+        timezone="Asia/Kolkata",
+        enable_utc=True,
+        worker_max_tasks_per_child=50,      # recycle worker after 50 tasks (memory safety)
+        task_acks_late=True,                 # only ack after task completes (no lost jobs)
+        task_reject_on_worker_lost=True,     # re-queue if worker crashes
+    )
+    return celery_app
+
+# Allowed file extensions
+ALLOWED_EXTENSIONS = {"pdf", "jpeg", "jpg", "png"}
+
+# API Keys loaded from environment variables
+API_KEYS = [os.getenv("API_KEY_1"), os.getenv("API_KEY_2")]
+
+# Usage limit per API key per day
+USAGE_LIMIT = 10
+
+# MySQL Configuration
+MYSQL_CONFIG = {
+    "host": os.getenv("MYSQL_HOST"),
+    "user": os.getenv("MYSQL_USER"),
+    "password": os.getenv("MYSQL_PASSWORD"),
+    "database": os.getenv("MYSQL_DB"),
+    "auth_plugin": "mysql_native_password",
+    "pool_name": "my_pool",
+    "pool_size": 20,
+    "autocommit": True,
+    "buffered": True,
+}
+
+# Connection Pool
+cnxpool = mysql.connector.pooling.MySQLConnectionPool(**MYSQL_CONFIG)
+
+def format_currency(value, symbol="₹"):
+    if value is None:
+        return None
+    try:
+        return f"{symbol} {float(value):.2f}"
+    except:
+        return value
+
+
+def get_db_connection():
+    """Returns a new MySQL connection from the pool."""
+    cnx = cnxpool.get_connection()
+    return cnx
+
+
+def fix_existing_limits():
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "UPDATE users SET account_limit = 50 WHERE account_limit IS NULL OR account_limit < 50"
+    )
+    conn.commit()
+    cursor.close()
+    conn.close()
+    print("User limits updated to 50")
+
+def init_db():
+       conn = get_db_connection()
+       cursor = conn.cursor()
+
+       cursor.execute(
+        """
+    CREATE TABLE IF NOT EXISTS contact_queries (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        email VARCHAR(255) NOT NULL,
+        contact VARCHAR(50),
+        message TEXT NOT NULL,
+        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+    )
+    """
+    )
+    
+       cursor.execute(
+        """
+    CREATE TABLE IF NOT EXISTS users (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        username VARCHAR(255) UNIQUE,
+        email VARCHAR(255) UNIQUE,
+        password VARCHAR(255),
+        phone VARCHAR(20),
+        invoices_extracted INT DEFAULT 10,
+        passports_extracted INT DEFAULT 10,
+        account_limit INT DEFAULT 50,
+        manual_limit INT DEFAULT 50,
+        api_limit INT DEFAULT 50,
+        role VARCHAR(50) DEFAULT 'user'
+    )
+    """
+    )
+
+       cursor.execute(
+        """
+    CREATE TABLE IF NOT EXISTS extraction_history (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        user_id INT,
+        timestamp DATETIME,
+        image_name VARCHAR(255),
+        pages_extracted INT,
+        extraction_type VARCHAR(50),
+        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+    )
+    """
+    )
+
+       cursor.execute(
+        """
+    CREATE TABLE IF NOT EXISTS api_keys (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        user_id INT,
+        api_key VARCHAR(255) UNIQUE,
+         created_at DATETIME,
+        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+    )
+    """
+    )
+
+       cursor.execute(
+        """
+    CREATE TABLE IF NOT EXISTS api_usage (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        api_key VARCHAR(255) UNIQUE,
+        count INT DEFAULT 0,
+        last_used DATE,
+        usage_limit INT,
+        FOREIGN KEY (api_key) REFERENCES api_keys(api_key) ON DELETE CASCADE
+    )
+    """
+    )
+
+    # ensure admin user exists
+       cursor.execute(
+        "SELECT * FROM users WHERE username = 'Niraj' AND email = 'connect.aiindia@gmail.com'"
+    )
+       admin_user = cursor.fetchone()
+       if not admin_user:
+          cursor.execute(
+            """
+            INSERT INTO users (username, email, password, role)
+            VALUES (
+                'Niraj',
+                'connect.aiindia@gmail.com',
+                '$2b$12$W9ObhLPinBHdnkX1XK6.U.Ub5mgx33abZtEY7xOVfHz5CMnM5tdWm',
+                'admin'
+            )
+        """
+        )
+          conn.commit()
+
+          cursor.close()
+          conn.close()
+
+
+# Re-initialize the database
+init_db()
+
+# Initialize the Flask app
+app = Flask(__name__)
+CORS(app)
+app.secret_key = os.getenv("FLASK_SECRET_KEY", default="fallback-secret-key")
+UPLOAD_FOLDER = "uploads"
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+app.config["UPLOAD_FOLDER"] = UPLOAD_FOLDER
+
+# ✅ Initialize Celery AFTER app is created
+celery = make_celery(app)
+
+
+def allowed_file(filename):
+    return "." in filename and filename.rsplit(".", 1)[1].lower() in ALLOWED_EXTENSIONS
+
+
+def check_usage(api_key):
+    current_date = datetime.now().date()
+    conn = get_db_connection()
+    cursor = conn.cursor(dictionary=True)
+    sql = "SELECT * FROM api_usage WHERE api_key = %s"
+    cursor.execute(sql, (api_key,))
+    usage_entry = cursor.fetchone()
+    if not usage_entry:
+        sql_insert = (
+            "INSERT INTO api_usage (api_key, count, last_used) VALUES (%s, %s, %s)"
+        )
+        cursor.execute(sql_insert, (api_key, 0, current_date))
+        conn.commit()
+        usage_entry = {"count": 0, "last_used": current_date, "usage_limit": None}
+    else:
+        if usage_entry["last_used"] < current_date:
+            sql_update = (
+                "UPDATE api_usage SET count = 0, last_used = %s WHERE api_key = %s"
+            )
+            cursor.execute(sql_update, (current_date, api_key))
+            conn.commit()
+            usage_entry["count"] = 0
+            usage_entry["last_used"] = current_date
+    usage_limit = (
+        usage_entry["usage_limit"]
+        if usage_entry["usage_limit"] is not None
+        else USAGE_LIMIT
+    )
+    result = usage_entry["count"] < usage_limit
+    cursor.close()
+    conn.close()
+    return result
+
+
+def api_key_required(f):
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        api_key = request.headers.get("X-API-Key")
+        if not api_key:
+            return jsonify({"error": "Unauthorized: API Key is required"}), 401
+        conn = get_db_connection()
+        cursor = conn.cursor(dictionary=True)
+        sql = "SELECT * FROM api_usage WHERE api_key = %s"
+        cursor.execute(sql, (api_key,))
+        key_record = cursor.fetchone()
+        if not key_record:
+            cursor.close()
+            conn.close()
+            return jsonify({"error": "Unauthorized: Invalid API Key"}), 401
+        if key_record["count"] >= (
+            key_record["usage_limit"]
+            if key_record["usage_limit"] is not None
+            else USAGE_LIMIT
+        ):
+            cursor.close()
+            conn.close()
+            return jsonify({"error": "Unauthorized: API Key usage limit exceeded"}), 403
+        sql_update = "UPDATE api_usage SET count = count + 1 WHERE api_key = %s"
+        cursor.execute(sql_update, (api_key,))
+        conn.commit()
+        cursor.close()
+        conn.close()
+        return f(*args, **kwargs)
+
+    return decorated_function
+
+
+def pdf_to_images_pymupdf(file_path):
+    doc = fitz.open(file_path)
+    images = []
+    for page_number in range(len(doc)):
+        page = doc.load_page(page_number)
+        pix = page.get_pixmap()
+        mode = "RGB" if pix.alpha == 0 else "RGBA"
+        image = Image.frombytes(mode, [pix.width, pix.height], pix.samples)
+        images.append(image)
+    return images
+
+HEADER_FIELDS = [
+    "invoice_id",
+    "invoice_number",
+    "invoice_date",
+    "due_date",
+    "customer_name",
+    "customer_gstin",
+    "seller_name",
+    "seller_gstin",
+    "currency_code",
+    "PO_number",
+    "DC_date",
+    "DC_number",
+    "invoice_amount",
+    "round_off",
+    "total_gst_rate",
+    "total_quantity",
+    "total_cgst_rate",
+    "total_cgst_amount",
+    "total_sgst_rate",
+    "total_sgst_amount",
+    "total_igst_rate",
+    "total_igst_amount",
+    "total_gst_amount"
+    
+]
+
+def generate_invoice_id(conn, invoice_source):
+    prefix = "M" if invoice_source == "manual" else "E"
+    today  = datetime.now().strftime("%Y%m%d")
+    cursor = conn.cursor()
+
+    try:
+        conn.start_transaction()
+
+        cursor.execute(
+            """
+            SELECT last_seq, last_date 
+            FROM invoice_id_lock 
+            WHERE id = 1 
+            FOR UPDATE
+            """
+        )
+        row = cursor.fetchone()
+
+        last_seq  = row[0] if row else 0
+        last_date = row[1] if row else ""
+
+        if last_date != today:
+            new_seq = 1
+        else:
+            new_seq = last_seq + 1
+
+        cursor.execute(
+            """
+            UPDATE invoice_id_lock 
+            SET last_seq = %s, last_date = %s
+            WHERE id = 1
+            """,
+            (new_seq, today)
+        )
+
+        conn.commit()
+
+        invoice_id = f"{prefix}{today}{str(new_seq).zfill(3)}"
+        print(f"✅ Generated invoice_id: {invoice_id}")
+        return invoice_id
+
+    except Exception as e:
+        conn.rollback()
+        print(f"❌ Invoice ID error: {e}")
+        import random
+        return f"{prefix}{today}{str(random.randint(100,999))}"
+
+    finally:
+        cursor.close()
+
+
+def extract_invoice_fields(file_path, invoice_source="electronic"):
+    try:
+        conn = get_db_connection()
+        invoice_id = generate_invoice_id(conn, invoice_source)
+
+        file_ext = os.path.splitext(file_path)[1].lower()
+
+        if file_ext == ".pdf":
+            images = pdf_to_images_pymupdf(file_path)
+        else:
+            images = [Image.open(file_path)]
+
+        import uuid
+        all_pages_data = []
+
+        for img in images:
+            response = model.generate_content([input_prompt, img])
+            response_text = response.text.strip("```").strip()
+            
+            if response_text.lower().startswith("json"):
+                response_text = response_text[4:].strip()
+
+            if "}" in response_text:
+                response_text = response_text[: response_text.rfind("}") + 1]
+
+            try:
+                page_data = json.loads(response_text)
+                all_pages_data.append(page_data)
+        
+            except json.JSONDecodeError as e:
+                print(f"JSON parsing error: {e}")
+                all_pages_data.append({
+                    "error": "Invalid JSON returned from Gemini",
+                    "details": response_text,
+                })
+            cgst_rates, sgst_rates, igst_rates = set(), set(), set()
+        print("🔍 ALL PAGES DATA:", all_pages_data)
+        if all_pages_data:
+             print("🔍 FIRST PAGE KEYS:", all_pages_data[0].keys())
+             print("🔍 ITEMS:", all_pages_data[0].get("items"))
+
+        from decimal import Decimal, ROUND_HALF_UP
+
+        def round2(value):
+          return float(
+            Decimal(str(value)).quantize(
+              Decimal("0.01"),
+                rounding=ROUND_HALF_UP
+        )
+        
+)      
+        def safe_float(value):
+          if value is None:
+            return 0.0
+          try:
+            cleaned = re.sub(r"[^\d.\-]", "", str(value).strip())
+            return float(cleaned) if cleaned else 0.0
+          except:
+             return 0.0
+
+        def process_gst(all_pages_data, final_header):
+             final_header["total_cgst_amount"] = 0
+             final_header["total_sgst_amount"] = 0
+             final_header["total_igst_amount"] = 0
+             final_header["total_gst_amount"] = 0
+
+             total_cgst_amount = 0
+             total_sgst_amount = 0
+             total_igst_amount = 0
+
+             cgst_rates = set()
+             sgst_rates = set()
+             igst_rates = set()
+
+             for page in all_pages_data:
+                 items = page.get("items") or page.get("Items") or []
+                 
+                 for item in items:
+                   print("DEBUG qty:", repr(item.get("quantity")), 
+                   "unit_price:", repr(item.get("unit_price")),
+                   "Value:", repr(item.get("Value")),
+                   "cgst_rate:", repr(item.get("cgst_rate")))
+                   qty = safe_float(item.get("quantity"))
+                   unit_price = safe_float(item.get("unit_price"))
+                   total_price = safe_float(item.get("total_price"))
+
+                   discount = safe_float(item.get("Discount"))
+                   value_field = safe_float(item.get("Value"))
+                   if value_field > 0:
+                       taxable = round2(value_field)
+                   elif discount > 0:
+                       gross = qty * unit_price
+                       taxable = round2(gross - (gross * discount / 100))
+                   elif total_price > 0:
+                      taxable = round2(total_price)
+                   else:
+                       taxable = round2(qty * unit_price)
+
+                   item["taxable_value"] = taxable
+
+                   cgst_rate = safe_float(item.get("cgst_rate"))
+                   sgst_rate = safe_float(item.get("sgst_rate"))
+                   igst_rate = safe_float(item.get("igst_rate"))
+                   item["cgst_amount"] = round2(taxable * cgst_rate / 100)
+                   item["sgst_amount"] = round2(taxable * sgst_rate / 100)
+                   item["igst_amount"] = round2(taxable * igst_rate / 100)
+                   item["GST_AMT"] = round2(item["cgst_amount"] + item["sgst_amount"] + item["igst_amount"])
+                   item["Gst%"] = round2(cgst_rate + sgst_rate + igst_rate)
+                   total_cgst_amount += item["cgst_amount"]
+                   total_sgst_amount += item["sgst_amount"]
+                   total_igst_amount += item["igst_amount"]
+
+                   if cgst_rate > 0:
+                     cgst_rates.add(cgst_rate)
+                   if sgst_rate > 0:
+                     sgst_rates.add(sgst_rate)
+                   if igst_rate > 0:
+                     igst_rates.add(igst_rate)
+
+                 page["items"] = items
+
+             final_header["total_cgst_amount"] = round2(total_cgst_amount)
+             final_header["total_sgst_amount"] = round2(total_sgst_amount)
+             final_header["total_igst_amount"] = round2(total_igst_amount)
+
+             final_header["total_gst_amount"] = round2(
+        total_cgst_amount + total_sgst_amount + total_igst_amount
+    )
+             
+             if len(cgst_rates) == 1:
+               final_header["total_cgst_rate"] = list(cgst_rates)[0]
+
+             if len(sgst_rates) == 1:
+               final_header["total_sgst_rate"] = list(sgst_rates)[0]
+
+             if len(igst_rates) == 1:
+               final_header["total_igst_rate"] = list(igst_rates)[0]
+
+             if final_header.get("total_igst_rate"):
+               final_header["total_gst_rate"] = final_header["total_igst_rate"]
+             elif final_header.get("total_cgst_rate") and final_header.get("total_sgst_rate"):
+               final_header["total_gst_rate"] = round2(
+                   final_header["total_cgst_rate"] +
+                   final_header["total_sgst_rate"]
+        )
+
+             return all_pages_data, final_header
+
+        print("🔍 ALL PAGES DATA:", all_pages_data)
+        final_header = {field: None for field in HEADER_FIELDS}
+
+        for page in all_pages_data:
+            for field in HEADER_FIELDS:
+                value = page.get(field)
+
+                if isinstance(value, dict):
+                    value = value.get("value")
+
+                if final_header[field] in (None, "", 0) and value not in (None, "", 0):
+                    final_header[field] = value
+                   
+        all_pages_data, final_header = process_gst(all_pages_data, final_header)
+
+        extracted_data = {
+            **final_header,
+            "items": [
+                item
+                for page in all_pages_data
+               for item in (page.get("items") or page.get("Items") or [])
+            ],
+        }
+
+        currency_code = None
+        header_currency = str(extracted_data.get("currency_code") or "").upper()
+
+        if header_currency in ["INR", "USD", "EUR", "GBP", "JPY", "SGD"]:
+            currency_code = header_currency
+
+        invoice_amount = str(extracted_data.get("invoice_amount") or "")
+
+        if not currency_code:
+            if "₹" in invoice_amount:
+                currency_code = "INR"
+            elif "$" in invoice_amount:
+                currency_code = "USD"
+            elif "€" in invoice_amount:
+                currency_code = "EUR"
+            elif "£" in invoice_amount:
+                currency_code = "GBP"
+            elif "¥" in invoice_amount:
+                currency_code = "JPY"
+
+        if not currency_code:
+            currency_code = "INR"
+
+        extracted_data["currency_code"] = currency_code
+
+        for key, value in extracted_data.items():
+          if isinstance(value, str):
+            extracted_data[key] = normalize_text(value)
+
+        for item in extracted_data.get("items", []):
+         for key, value in item.items():
+           if isinstance(value, str):
+            item[key] = normalize_text(value)
+
+        extracted_data["invoice_id"] = invoice_id
+        conn.close()
+        return extracted_data
+    except Exception as e:
+        print("Extraction error:", e)
+        return {"error": str(e)}
+
+
+# ================================================================
+# ✅ CELERY TASK — runs extraction in background worker
+#    max_retries=3: if Gemini fails, it retries automatically
+#    bind=True: gives access to self for retry control
+# ================================================================
+@celery.task(bind=True, max_retries=3, default_retry_delay=5)
+def extract_invoice_task(self, file_path, invoice_source="electronic"):
+    """
+    Background task for invoice extraction.
+    Called by /process-invoice and /api/extract_invoice routes.
+    Retries up to 3 times on failure with 5s delay.
+    """
+    try:
+        result = extract_invoice_fields(file_path, invoice_source)
+        return result
+    except Exception as exc:
+        print(f"❌ Task failed (attempt {self.request.retries + 1}): {exc}")
+        raise self.retry(exc=exc, countdown=5 * (self.request.retries + 1))
+
+
+@app.route("/process-invoice", methods=["POST"])
+@api_key_required
+def process_invoice():
+    """
+    n8n calls this endpoint with each invoice file.
+    Instead of blocking, it queues the job and returns a job_id immediately.
+    n8n then polls /job-status/<job_id> to get the result.
+    """
+    try:
+        if "file" not in request.files:
+            return jsonify({"error": "No file part"}), 400
+
+        file = request.files["file"]
+
+        if file.filename == "":
+            return jsonify({"error": "No selected file"}), 400
+
+        if file and allowed_file(file.filename):
+            filename = secure_filename(file.filename)
+            filepath = os.path.join(app.config["UPLOAD_FOLDER"], filename)
+            file.save(filepath)
+
+            invoice_source = request.form.get("invoice_source", "electronic")
+
+            # ✅ Queue the job — returns immediately with job_id
+            task = extract_invoice_task.delay(filepath, invoice_source)
+
+            return jsonify({
+                "job_id": task.id,
+                "status": "queued",
+                "message": "Invoice queued for processing. Poll /job-status/<job_id> for result."
+            }), 202
+
+        return jsonify({"error": "Invalid file type"}), 400
+
+    except Exception as e:
+        logging.error(f"Error during upload or extraction: {e}")
+        return jsonify({"error": "Internal Server Error"}), 500
+
+
+# ================================================================
+# ✅ JOB STATUS ENDPOINT — n8n polls this after submitting invoice
+# ================================================================
+@app.route("/job-status/<job_id>", methods=["GET"])
+def job_status(job_id):
+    """
+    n8n polls this endpoint with the job_id received from /process-invoice.
+    Returns status: queued | processing | done | failed
+    When status is 'done', result contains the extracted invoice data.
+    """
+    task = extract_invoice_task.AsyncResult(job_id)
+
+    if task.state == "PENDING":
+        return jsonify({"job_id": job_id, "status": "queued"})
+
+    elif task.state == "STARTED":
+        return jsonify({"job_id": job_id, "status": "processing"})
+
+    elif task.state == "SUCCESS":
+        return jsonify({
+            "job_id": job_id,
+            "status": "done",
+            "result": task.result
+        })
+
+    elif task.state == "FAILURE":
+        return jsonify({
+            "job_id": job_id,
+            "status": "failed",
+            "error": str(task.info)
+        }), 500
+
+    else:
+        return jsonify({"job_id": job_id, "status": task.state.lower()})
+
+
+@app.route("/usage-count", methods=["GET"])
+@api_key_required
+def get_usage_count():
+    api_key = request.headers.get("X-API-Key")
+    conn = get_db_connection()
+    cursor = conn.cursor(dictionary=True)
+    sql = "SELECT * FROM api_usage WHERE api_key = %s"
+    cursor.execute(sql, (api_key,))
+    usage_entry = cursor.fetchone()
+    cursor.close()
+    conn.close()
+    if usage_entry:
+        return jsonify(
+            {
+                "api_key": api_key,
+                 "usage_count": usage_entry["count"],
+                "last_used": usage_entry["last_used"].strftime("%Y-%m-%d"),
+            }
+        )
+    else:
+        return jsonify({"error": "API key not found"}), 404
+
+
+@app.route("/all-usage-counts", methods=["GET"])
+@api_key_required
+def get_all_usage_counts():
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor(dictionary=True)
+        sql = "SELECT * FROM api_usage"
+        cursor.execute(sql)
+        usage_entries = cursor.fetchall()
+        usage_data = []
+        for entry in usage_entries:
+            usage_data.append(
+                {
+                    "api_key": entry["api_key"],
+                    "usage_count": entry["count"],
+                    "last_used": entry["last_used"].strftime("%Y-%m-%d"),
+                }
+            )
+        cursor.close()
+        conn.close()
+        return jsonify(usage_data), 200
+    except Exception as e:
+        return jsonify({"error": f"Internal Server Error: {str(e)}"}), 500
+
+
+DMIN_API_KEY = os.getenv("ADMIN_API_KEY")
+
+
+@app.route("/admin/dashboard")
+def admin_dashboard():
+    if "user" not in session or session.get("role") != "admin":
+        flash("Unauthorized access.")
+        return redirect(url_for("login"))
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor(dictionary=True)
+
+        cursor.execute("SELECT * FROM users")
+        users = cursor.fetchall()
+
+        cursor.execute("SELECT * FROM api_keys")
+        api_keys = cursor.fetchall()
+        cursor.close()
+        conn.close()
+
+        api_keys_dict = {}
+        for key in api_keys:
+            uid = key["user_id"]
+            api_keys_dict.setdefault(uid, []).append(key)
+
+        user_activity = []
+        for u in users:
+            u_id = u["id"]
+            user_activity.append(
+                {
+                    "username": u["username"],
+                    "email": u["email"],
+                    "phone": u.get("phone", "—"),
+                    "invoices_extracted": u.get("invoices_extracted", 0),
+                    "account_limit": u.get("account_limit", 3),
+                    "api_keys": api_keys_dict.get(u_id, []),
+                    "user_id": u_id,
+                }
+            )
+
+        return render_template("admin_dashboard.html", user_activity=user_activity)
+
+    except Exception as e:
+        flash(f"Error loading dashboard: {e}")
+        return render_template("admin_dashboard.html", user_activity=[])
+
+
+@app.route("/admin/update-user-limit", methods=["POST"])
+def update_user_limit():
+    try:
+        data = request.get_json()
+        user_id = data.get("user_id")
+        new_account_limit = data.get("new_account_limit")
+        app.logger.info(f"Request data: {data}")
+        app.logger.info(
+            f"Received user_id: {user_id}, New account limit: {new_account_limit}"
+        )
+        if not user_id or new_account_limit is None:
+            return jsonify({"error": "Missing required parameters"}), 400
+        try:
+            user_id = int(user_id)
+            new_account_limit = int(new_account_limit)
+            if new_account_limit < 0:
+                return (
+                    jsonify({"error": "Account limit must be a positive integer"}),
+                    400,
+                )
+        except ValueError:
+             return jsonify({"error": "Account limit must be a valid integer"}), 400
+        conn = get_db_connection()
+        cursor = conn.cursor(dictionary=True)
+        sql = "SELECT * FROM users WHERE id = %s"
+        cursor.execute(sql, (user_id,))
+        user = cursor.fetchone()
+        if not user:
+            cursor.close()
+            conn.close()
+            return jsonify({"error": "User not found"}), 404
+        app.logger.info(f"User found: {user}")
+        sql_update = "UPDATE users SET account_limit = %s WHERE id = %s"
+        cursor.execute(sql_update, (new_account_limit, user_id))
+        conn.commit()
+        modified_count = cursor.rowcount
+        cursor.close()
+        conn.close()
+        app.logger.info(f"Update result: {modified_count}")
+        if modified_count == 0:
+            return jsonify({"error": "No changes made"}), 404
+        app.logger.info(f"User {user_id}'s account limit updated: {new_account_limit}")
+        return (
+            jsonify(
+                {
+                    "message": f"Account limit updated to {new_account_limit} for user {user_id}"
+                }
+            ),
+            200,
+        )
+    except Exception as e:
+        app.logger.error(f"Error updating user limit: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/some-a-endpoint", methods=["GET"])
+def some_api_endpoint():
+    api_key = request.headers.get("X-API-Key")
+    if not api_key:
+        return jsonify({"error": "API key is missing"}), 400
+    print(f"Received API Key: {api_key}")
+    conn = get_db_connection()
+    cursor = conn.cursor(dictionary=True)
+    sql = "SELECT * FROM api_usage WHERE api_key = %s"
+    cursor.execute(sql, (api_key,))
+    current_data = cursor.fetchone()
+    print(f"Current Data: {current_data}")
+    if not current_data:
+        cursor.close()
+        conn.close()
+        return jsonify({"error": "API key not found"}), 404
+    sql_update = "UPDATE api_usage SET count = count + 1 WHERE api_key = %s"
+    cursor.execute(sql_update, (api_key,))
+    conn.commit()
+    cursor.execute(sql, (api_key,))
+    updated_data = cursor.fetchone()
+    print(f"Updated Data After Increment: {updated_data}")
+    cursor.close()
+    conn.close()
+    return jsonify(
+        {"message": "API key usage incremented successfully", "data": updated_data}
+    )
+
+
+@app.route("/", methods=["GET"])
+def index():
+    if "user" in session:
+        return redirect(url_for("home_logged_in"))
+    return render_template("home.html", logged_in=False)
+
+
+@app.route("/invoice")
+def invoice():
+    return render_template("invoice.html")
+
+
+@app.route("/passport")
+def passport():
+    return render_template("passport.html")
+
+
+from email_validator import validate_email, EmailNotValidError
+import phonenumbers
+from phonenumbers import NumberParseException
+
+
+def validate_user_email(email):
+    try:
+        v = validate_email(email)
+        return v.email, None
+    except EmailNotValidError as e:
+        return None, str(e)
+
+
+def validate_phone_number(raw_phone, default_region="IN"):
+    try:
+        pn = phonenumbers.parse(raw_phone, default_region)
+        if not phonenumbers.is_valid_number(pn):
+            return None, "Phone number is not valid"
+        e164 = phonenumbers.format_number(pn, phonenumbers.PhoneNumberFormat.E164)
+        return e164, None
+    except NumberParseException as e:
+         return None, str(e)
+
+
+@app.route("/signup", methods=["GET", "POST"])
+def signup():
+    if request.method == "POST":
+        username = request.form["username"].strip()
+        email_in = request.form["email"].strip()
+        phone_in = request.form.get("phone", "").strip()
+        password = request.form["password"]
+
+        email, email_err = validate_user_email(email_in)
+        if email_err:
+            flash(f"Invalid email address: {email_err}", "error")
+            return redirect(url_for("signup"))
+
+        phone, phone_err = validate_phone_number(phone_in)
+        if phone_err:
+            flash(f"Invalid phone number: {phone_err}", "error")
+            return redirect(url_for("signup"))
+
+        plain_password = password
+
+        try:
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            sql = """
+                INSERT INTO users (username, email, password, phone)
+                VALUES (%s, %s, %s, %s)
+            """
+            cursor.execute(sql, (username, email, plain_password, phone))
+            conn.commit()
+            cursor.close()
+            conn.close()
+
+            flash("Sign up successful! Please log in.", "success")
+            return redirect(url_for("login"))
+
+        except Exception as e:
+            flash(f"Unexpected Error: {e}", "error")
+
+    return render_template("appsignup.html")
+
+
+@app.route("/forgot_password", methods=["GET", "POST"])
+def forgot_password():
+    if request.method == "POST":
+        email = request.form["email"]
+        try:
+            conn = get_db_connection()
+            cursor = conn.cursor(dictionary=True)
+            sql = "SELECT * FROM users WHERE email = %s"
+            cursor.execute(sql, (email,))
+            user = cursor.fetchone()
+            cursor.close()
+            conn.close()
+            if user:
+                session["reset_email"] = email
+                flash("Please enter your new password.")
+                return redirect(url_for("reset_password"))
+            else:
+                flash("No account found with this email.")
+        except Exception as e:
+            flash(f"Error: {e}")
+    return render_template("appforget.html")
+ 
+
+from flask import render_template
+from zoneinfo import ZoneInfo
+
+
+def to_ist(utc_dt):
+    if utc_dt.tzinfo is None:
+        utc_dt = utc_dt.replace(tzinfo=ZoneInfo("UTC"))
+    ist_dt = utc_dt.astimezone(ZoneInfo("Asia/Kolkata"))
+    return ist_dt
+
+UPLOAD_FOLDER = os.path.join(os.getcwd(), "uploads", "invoices")
+
+
+@app.route("/view-invoice/<int:invoice_id>")
+def view_invoice(invoice_id):
+    user_id = session.get("user_id")
+    if not user_id:
+        return redirect(url_for("login"))
+
+    conn = get_db_connection()
+    cursor = conn.cursor(dictionary=True)
+
+    cursor.execute(
+        """
+        SELECT extracted_data, image_name, timestamp
+        FROM extraction_history
+        WHERE id = %s AND user_id = %s
+        """,
+        (invoice_id, user_id)
+    )
+    invoice = cursor.fetchone()
+
+    cursor.close()
+    conn.close()
+
+    if not invoice:
+        return "Invoice not found", 404
+
+    if not invoice["extracted_data"]:
+     return "JSON extraction not available for this invoice", 404
+
+    extracted_json = json.loads(invoice["extracted_data"])
+
+    return render_template(
+        "view_invoice_json.html",
+        invoice_json=json.dumps(extracted_json, indent=4),
+        image_name=invoice["image_name"],
+        timestamp=invoice["timestamp"],
+    )
+
+
+@app.route("/invoice-history")
+def invoice_history_page():
+    user_id = session.get("user_id")
+    if not user_id:
+        return redirect(url_for("login"))
+
+    conn = get_db_connection()
+    cursor = conn.cursor(dictionary=True)
+
+    cursor.execute(
+        """
+        SELECT id, timestamp, image_name
+        FROM extraction_history
+        WHERE user_id = %s
+        AND extracted_data IS NOT NULL
+        ORDER BY timestamp DESC
+        """,
+        (user_id,)
+    )
+
+    rows = cursor.fetchall()
+    cursor.close()
+    conn.close()
+
+    invoice_history = []
+
+    for row in rows:
+     invoice_history.append({
+            "id": row["id"],
+            "timestamp_str": row["timestamp"].strftime("%d-%m-%Y %I:%M:%S %p"),
+            "image_name": row["image_name"],
+        })
+
+    return render_template("view_history.html", invoice_history=invoice_history)
+
+
+@app.route("/invoice-json/<int:invoice_id>")
+def invoice_json(invoice_id):
+    user_id = session.get("user_id")
+    if not user_id:
+        return redirect(url_for("login"))
+
+    conn = get_db_connection()
+    cursor = conn.cursor(dictionary=True)
+
+    cursor.execute(
+        """
+        SELECT extracted_data
+        FROM extraction_history
+        WHERE id = %s AND user_id = %s
+        """,
+        (invoice_id, user_id)
+    )
+
+    row = cursor.fetchone()
+
+    cursor.close()
+    conn.close()
+    if not row or not row["extracted_data"]:
+        return "Extraction not available", 404
+
+    extracted_data = json.loads(row["extracted_data"])
+
+    return render_template("view_invoice_json.html", extracted_data=extracted_data)
+
+
+@app.route("/reset_password", methods=["GET", "POST"])
+def reset_password():
+    if "reset_email" not in session:
+        flash("Invalid reset attempt.")
+        return redirect(url_for("forgot_password"))
+
+    if request.method == "POST":
+        new_password = request.form["password"]
+
+        try:
+            conn = get_db_connection()
+            cursor = conn.cursor()
+
+            sql = "UPDATE users SET password = %s WHERE email = %s"
+            cursor.execute(sql, (new_password, session["reset_email"]))
+            conn.commit()
+            cursor.close()
+            conn.close()
+
+            session.pop("reset_email", None)
+            flash("Password reset successfully.")
+            return redirect(url_for("login"))
+
+        except Exception as e:
+            flash(f"Error: {e}")
+
+    return render_template("appreset.html")
+
+
+def get_user_from_db(login_input, password):
+    conn = get_db_connection()
+    cursor = conn.cursor(dictionary=True)
+
+    cursor.execute(
+        """
+        SELECT * FROM users
+        WHERE (username = %s OR email = %s)
+        """,
+        (login_input, login_input),
+    )
+
+    user = cursor.fetchone()
+
+    cursor.close()
+    conn.close()
+
+    if user and user["password"] == password:
+        return user
+
+    return None
+
+
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    if request.method == "POST":
+        login_input = request.form.get("username")
+        password = request.form.get("password")
+
+        conn = get_db_connection()
+        cursor = conn.cursor(dictionary=True)
+
+        cursor.execute(
+            "SELECT * FROM users WHERE username=%s OR email=%s",
+            (login_input, login_input),
+        )
+        user = cursor.fetchone()
+
+        cursor.close()
+        conn.close()
+
+        if user and password == user["password"]:
+            session.clear()
+
+            session["user_id"] = user["id"]
+            session["user"] = user["username"]
+            session["role"] = user.get("role", "user")
+            if user["role"] == "dmh":
+                return redirect(url_for("dmh_dashboard"))
+            else:
+                return redirect(url_for("dashboard"))
+
+        flash("Invalid login details", "error")
+
+    return render_template("applogin.html")
+
+
+import uuid
+
+@app.route("/upload-invoice", methods=["POST"])
+def upload_invoice():
+    user_id = session.get("user_id")
+    role = session.get("role")
+   
+    if not user_id or role not in ["user", "dmh"]:
+        return redirect(url_for("login"))
+
+    file = request.files["invoice"]
+    file_path = save_file(file)
+
+    if file_path.lower().endswith(".pdf"):
+        images = pdf_to_images_pymupdf(file_path)
+    else:
+        images = [Image.open(file_path)]
+
+    extracted_data = extract_invoice_fields(file_path)
+
+    if not extracted_data:
+        extracted_data = {}
+
+    pages_extracted = len(extracted_data)
+    extraction_type = "invoice"
+    image_name = os.path.basename(file_path)
+    extracted_json = json.dumps(extracted_data)
+    ist_now = datetime.now(ZoneInfo("Asia/Kolkata")).replace(tzinfo=None)
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    cursor.execute(
+        """
+        INSERT INTO extraction_history
+        (user_id, timestamp, image_name, pages_extracted, extraction_type, extracted_data)
+        VALUES (%s, %s, %s, %s, %s, %s)
+        """,
+        (
+            user_id,
+            ist_now,
+            image_name,
+            pages_extracted,
+            extraction_type,
+             extracted_json
+        ),
+    )
+
+    conn.commit()
+    cursor.close()
+    conn.close()
+
+    return redirect(url_for("view_history"))
+
+
+import fitz  # PyMuPDF
+from PIL import Image
+import io
+
+
+def pdf_to_images_pymupdf(pdf_path, dpi=200):
+    images = []
+    zoom = dpi / 72
+    mat = fitz.Matrix(zoom, zoom)
+
+    doc = fitz.open(pdf_path)
+    for page in doc:
+        pix = page.get_pixmap(matrix=mat, alpha=False)
+        img = Image.open(io.BytesIO(pix.tobytes("png")))
+        images.append(img)
+
+    doc.close()
+    return images
+
+
+@app.route("/upload_image", methods=["GET", "POST"])
+def upload_image():
+
+    user_id = session.get("user_id")
+    role    = session.get("role")
+
+    if not user_id or role not in ["user", "dmh"]:
+        return redirect(url_for("login"))
+
+    conn   = None
+    cursor = None
+
+    try:
+        conn   = get_db_connection()
+        cursor = conn.cursor(dictionary=True)
+
+        cursor.execute("SELECT * FROM users WHERE username = %s", (session["user"],))
+        user = cursor.fetchone()
+
+        if not user:
+            flash("User not found.", "error")
+            return redirect(url_for("login"))
+
+        total_extracted  = user.get("invoices_extracted", 0) + user.get("passports_extracted", 0)
+        extraction_limit = user.get("account_limit") or 50
+
+        if total_extracted >= extraction_limit:
+            flash("You have reached your extraction limit.", "error")
+            return redirect(url_for("dashboard"))
+
+        if request.method == "POST":
+
+            if session.get("processing", False):
+                flash("Please wait until current extraction completes.", "warning")
+                return redirect(url_for("dashboard"))
+
+            doc_type = request.form.get("doc_type")
+            if doc_type not in ["invoice", "passport"]:
+                flash("Invalid document type.", "error")
+                return redirect(url_for("dashboard"))
+
+            file = request.files.get("file")
+            if not file or not allowed_file(file.filename):
+                flash("Invalid file. Upload PDF or Image.", "error")
+                return redirect(url_for("dashboard"))
+
+            original_filename = secure_filename(file.filename)
+            unique_filename   = f"{uuid.uuid4()}_{original_filename}"
+            file_path         = os.path.join(app.config["UPLOAD_FOLDER"], unique_filename)
+            file.save(file_path)
+
+            session["processing"] = True
+
+            if doc_type == "invoice":
+                ext            = original_filename.lower()
+                invoice_source = "manual" if ext.endswith((".jpg", ".jpeg", ".png")) else "email"
+
+                extracted_data = extract_invoice_fields(file_path, invoice_source)
+                invoice_id     = extracted_data.get("invoice_id")
+                update_field   = "invoices_extracted"
+
+            else:
+                extracted_data = extract_passport_fields(file_path)
+                update_field   = "passports_extracted"
+                invoice_id     = None
+                invoice_source = None
+
+            if not extracted_data or "error" in extracted_data:
+                flash("Extraction failed.", "error")
+                session["processing"] = False
+                return redirect(url_for("dashboard"))
+
+            page_count = len(extracted_data)
+
+            cursor.execute(
+                f"UPDATE users SET {update_field} = {update_field} + %s WHERE username = %s",
+                (page_count, session["user"]),
+            )
+
+            cursor.execute(
+                """
+                INSERT INTO extraction_history
+                (
+                    invoice_id,
+                    invoice_source,
+                    user_id,
+                    timestamp,
+                    image_name,
+                    pages_extracted,
+                    extraction_type,
+                    extracted_data,
+                    file_path
+                )
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                """,
+                (
+                    invoice_id,
+                    invoice_source,
+                    user["id"],
+                    datetime.now(),
+                    original_filename,
+                    page_count,
+                    doc_type,
+                    json.dumps(extracted_data),
+                    file_path,
+                ),
+            )
+
+            conn.commit()
+            session["processing"] = False
+
+            return render_template(
+                "result.html",
+                json_data=json.dumps(extracted_data, indent=4),
+                invoice_id=invoice_id,
+            )
+
+        return redirect(url_for("dashboard"))
+
+    except Exception as e:
+        logging.error(f"Upload error: {e}", exc_info=True)
+        flash(f"Error: {e}", "error")
+        return redirect(url_for("dashboard"))
+
+    finally:
+        if cursor:
+            cursor.close()
+        if conn:
+            conn.close()
+        session["processing"] = False
+
+        try:
+            if "file_path" in locals() and os.path.exists(file_path):
+                os.remove(file_path)
+                print(f"✅ Temp file deleted: {file_path}")
+        except Exception as e:
+            print(f"⚠️ Could not delete temp file: {e}")
+
+
+@app.route("/download_file", methods=["POST"])
+def download_file():
+    invoice_data = request.form.get("json_data")
+    file_format = request.form.get("file_format")
+    if not invoice_data:
+        return "No data available for download", 400
+    try:
+        parsed_data = json.loads(invoice_data)
+    except json.JSONDecodeError:
+        return "Invalid JSON data", 400
+    if file_format == "json":
+        json_str = json.dumps(parsed_data, indent=4)
+        buffer = io.BytesIO(json_str.encode("utf-8"))
+        buffer.seek(0)
+        return send_file(
+            buffer,
+            as_attachment=True,
+            download_name="invoice_data.json",
+            mimetype="application/json",
+        )
+    elif file_format == "excel":
+        if isinstance(parsed_data, dict) and all(
+            key.startswith("page_") for key in parsed_data.keys()
+        ):
+            data_list = []
+            for key, value in parsed_data.items():
+                if isinstance(value, dict):
+                    value["page"] = key
+                data_list.append(value)
+            df = pd.DataFrame(data_list)
+        else:
+            df = pd.DataFrame([parsed_data])
+        buffer = io.BytesIO()
+        with pd.ExcelWriter(buffer, engine="xlsxwriter") as writer:
+            df.to_excel(writer, index=False)
+        buffer.seek(0)
+        return send_file(
+            buffer,
+            as_attachment=True,
+            download_name="invoice_data.xlsx",
+            mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+
+
+@app.route("/dashboard", methods=["GET", "POST"])
+def dashboard():
+    if "user" not in session:
+        if request.is_json:
+            return jsonify({"error": "Unauthorized access. Please log in."}), 401
+        flash("Please login first.", "warning")
+        return redirect(url_for("login"))
+    if session.get("role") == "dmh":
+        return redirect(url_for("dmh_dashboard"))
+
+    conn = None
+    cursor = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor(dictionary=True)
+
+        sql = "SELECT * FROM users WHERE username = %s"
+        cursor.execute(sql, (session["user"],))
+        user = cursor.fetchone()
+
+        if not user:
+            flash("User not found.", "error")
+            if request.is_json:
+                return jsonify({"error": "User not found."}), 404
+            return redirect(url_for("login"))
+
+        username = user.get("username", "N/A")
+        email = user.get("email", "N/A")
+        invoices_count = user.get("invoices_extracted", 0)
+        passports_count = user.get("passports_extracted", 0)
+
+        sql_history = "SELECT * FROM extraction_history WHERE user_id = %s ORDER BY timestamp DESC"
+        cursor.execute(sql_history, (user["id"],))
+        history = cursor.fetchall()
+
+        sql_api_key = "SELECT api_key FROM api_keys WHERE user_id = %s"
+        cursor.execute(sql_api_key, (user["id"],))
+        user_api_key = cursor.fetchone()
+        api_key = user_api_key["api_key"] if user_api_key else None
+
+        formatted_history = [
+            {
+                "timestamp_str": entry["timestamp"].strftime("%Y-%m-%d %H:%M:%S"),
+                "image_name": entry.get("image_name", "Unknown"),
+                "pages_extracted": entry.get("pages_extracted", 0),
+                "extraction_type": entry.get("extraction_type", "N/A"),
+            }
+            for entry in history
+        ]
+
+        if request.is_json:
+            return jsonify(
+                {
+                    "username": username,
+                    "email": email,
+                    "invoices_count": invoices_count,
+                    "passports_count": passports_count,
+                    "history": formatted_history,
+                    "api_key": api_key,
+                }
+            )
+
+        return render_template(
+            "dashboard.html",
+            username=username,
+            email=email,
+            invoices_count=invoices_count,
+            passports_count=passports_count,
+            history=formatted_history,
+            api_key=api_key,
+        )
+    except mysql.connector.Error as db_err:
+        logging.error(f"Database error: {db_err}", exc_info=True)
+        flash(f"Database error: {db_err}", "error")
+        if request.is_json:
+            return jsonify({"error": str(db_err)}), 500
+        return render_template(
+            "dashboard.html",
+            username="N/A",
+            email="N/A",
+            invoices_count=0,
+            passports_count=0,
+            history=[],
+            api_key=None,
+        )
+
+    except Exception as e:
+        logging.error(f"Unexpected error in dashboard: {e}", exc_info=True)
+        flash(f"Error: {e}", "error")
+        if request.is_json:
+            return jsonify({"error": str(e)}), 500
+        return render_template(
+            "dashboard.html",
+            username="N/A",
+            email="N/A",
+            invoices_count=0,
+            passports_count=0,
+            history=[],
+            api_key=None,
+        )
+
+    finally:
+        if cursor:
+            cursor.close()
+        if conn:
+            conn.close()
+
+
+@app.route("/dmh/dashboard")
+def dmh_dashboard():
+    if session.get("role") != "dmh":
+        return redirect(url_for("login"))
+
+    return render_template("dmh_dashboard.html")
+
+
+@app.route("/view_history")
+def view_history():
+    user_id = session.get("user_id")
+    role = session.get("role")
+
+    if not user_id or role not in ["user", "dmh"]:
+        return redirect(url_for("login"))
+
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor(dictionary=True)
+
+        cursor.execute(
+            "SELECT id FROM users WHERE username = %s",
+            (session["user"],)
+        )
+        user = cursor.fetchone()
+
+        if not user:
+            cursor.close()
+            conn.close()
+            return redirect(url_for("login"))
+
+        cursor.execute(
+            "SELECT * FROM extraction_history WHERE user_id = %s ORDER BY timestamp DESC",
+            (user["id"],)
+        )
+        invoice_history = cursor.fetchall()
+
+        formatted_history = []
+
+        for entry in invoice_history:
+            utc_time = entry["timestamp"]
+
+            if utc_time.tzinfo is None:
+                utc_time = utc_time.replace(tzinfo=timezone.utc)
+
+            ist_time = utc_time.astimezone(ZoneInfo("Asia/Kolkata"))
+
+            entry["timestamp_str"] = ist_time.strftime(
+                "%d-%m-%Y %I:%M:%S %p"
+            )
+
+            formatted_history.append(entry)
+
+        cursor.close()
+        conn.close()
+
+        return render_template(
+            "view_history.html",
+            invoice_history=formatted_history
+        )
+    except Exception as e:
+        print("Error:", e)
+        return "Something went wrong", 500
+
+
+@app.route("/api/extract_invoice", methods=["POST"])
+def api_extract_invoice():
+    """
+    Legacy endpoint kept for backward compatibility.
+    Now also uses the queue — returns job_id instead of blocking.
+    """
+    if "api_key" not in request.headers:
+        return jsonify({"error": "Missing API key"}), 401
+    api_key = request.headers["api_key"]
+    conn = get_db_connection()
+    cursor = conn.cursor(dictionary=True)
+    sql = "SELECT * FROM api_keys WHERE api_key = %s"
+    cursor.execute(sql, (api_key,))
+    api_key_record = cursor.fetchone()
+    if not api_key_record:
+        cursor.close()
+        conn.close()
+        return jsonify({"error": "Invalid API key"}), 403
+    file = request.files.get("file")
+    if not file or not allowed_file(file.filename):
+        cursor.close()
+        conn.close()
+        return (
+            jsonify(
+                {"error": "Invalid file type. Please upload a valid PDF or image."}
+            ),
+            400,
+        )
+    filename = secure_filename(file.filename)
+    file_path = os.path.join(app.config["UPLOAD_FOLDER"], filename)
+    file.save(file_path)
+
+    # ✅ Queue the task, don't block
+    task = extract_invoice_task.delay(file_path)
+
+    # Update usage count
+    sql_update = (
+        "UPDATE users SET invoices_extracted = invoices_extracted + 1 WHERE id = %s"
+    )
+    cursor.execute(sql_update, (api_key_record["user_id"],))
+    conn.commit()
+    cursor.close()
+    conn.close()
+
+    return jsonify({
+        "success": True,
+        "job_id": task.id,
+        "status": "queued",
+        "message": "Invoice queued. Poll /job-status/<job_id> for result."
+    }), 202
+
+
+@app.route("/generate_api_key", methods=["POST"])
+def generate_api_key():
+    if "user" not in session:
+        return jsonify({"error": "Unauthorized. Please log in first."}), 401
+    conn = get_db_connection()
+    cursor = conn.cursor(dictionary=True)
+    sql = "SELECT id FROM users WHERE username = %s"
+    cursor.execute(sql, (session["user"],))
+    user = cursor.fetchone()
+    if not user:
+        cursor.close()
+        conn.close()
+        return jsonify({"error": "User not found."}), 404
+    sql_check = "SELECT * FROM api_keys WHERE user_id = %s"
+    cursor.execute(sql_check, (user["id"],))
+    existing_api_key = cursor.fetchone()
+    if existing_api_key:
+        cursor.close()
+        conn.close()
+        return jsonify({"error": "You have already generated an API key."}), 400
+    api_key = secrets.token_hex(32)
+    sql_insert = (
+        "INSERT INTO api_keys (user_id, api_key, created_at) VALUES (%s, %s, %s)"
+    )
+    cursor.execute(sql_insert, (user["id"], api_key, datetime.utcnow()))
+    conn.commit()
+    cursor.close()
+    conn.close()
+    return jsonify({"api_key": api_key, "success": True})
+
+
+@app.route("/logout")
+def logout():
+    session.pop("user", None)
+    flash("Logged out successfully!")
+    return redirect(url_for("index"))
+
+
+@app.route("/admin/set-account-limit", methods=["POST"])
+def set_account_limit():
+    try:
+        data = request.get_json()
+        new_manual_limit = data.get("manual_limit", 50)
+        new_api_limit = data.get("api_limit", 50)
+        if new_manual_limit < 0 or new_api_limit < 0:
+            return jsonify({"error": "Limits must be positive integers"}), 400
+        total_account_limit = new_manual_limit + new_api_limit
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        sql = "UPDATE users SET manual_limit = %s, api_limit = %s, account_limit = %s"
+        cursor.execute(sql, (new_manual_limit, new_api_limit, total_account_limit))
+        conn.commit()
+        modified_count = cursor.rowcount
+        cursor.close()
+        conn.close()
+        if modified_count == 0:
+            return jsonify({"message": "No users updated"}), 404
+        return (
+            jsonify(
+                {
+                    "message": f"Account limits set to {total_account_limit} for all users"
+                }
+            ),
+            200,
+        )
+    except Exception as e:
+        app.logger.error(f"Error setting account limits: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/get_api_key", methods=["GET"])
+def get_api_key():
+    if "user" not in session:
+        return jsonify({"error": "Unauthorized. Please log in first."}), 401
+    conn = get_db_connection()
+    cursor = conn.cursor(dictionary=True)
+    sql = "SELECT id FROM users WHERE username = %s"
+    cursor.execute(sql, (session["user"],))
+    user = cursor.fetchone()
+    if not user:
+        cursor.close()
+        conn.close()
+        return jsonify({"error": "User not found."}), 404
+    sql_api = "SELECT api_key FROM api_keys WHERE user_id = %s"
+    cursor.execute(sql_api, (user["id"],))
+    api_key = cursor.fetchone()
+    cursor.close()
+    conn.close()
+    if api_key:
+        return jsonify({"api_key": api_key["api_key"], "success": True})
+    else:
+        return jsonify({"error": "No API key found."}), 404
+
+
+@app.route("/api/routes", methods=["GET"])
+def list_routes():
+    routes = []
+    for rule in app.url_map.iter_rules():
+        routes.append(
+            {"endpoint": rule.endpoint, "methods": list(rule.methods), "url": str(rule)}
+        )
+    return jsonify({"routes": routes})
+
+
+port = int(os.getenv("PORT", 8080))
+
+@app.route("/about")
+def about():
+    return render_template("about.html")
+
+
+@app.route("/pricing")
+def pricing():
+    return render_template("pricing.html")
+
+
+@app.route("/contact_sales")
+def contact_sales():
+    return render_template("about.html")
+
+
+import os
+from flask import Flask, request, jsonify
+from dotenv import load_dotenv
+import smtplib
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+
+print("Current working directory:", os.getcwd())
+
+load_dotenv()
+
+EMAIL_ADDRESS = os.getenv("EMAIL_ADDRESS")
+EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD")
+RECIPIENT_EMAIL = os.getenv("RECIPIENT_EMAIL")
+SMTP_SERVER = "smtp.gmail.com"
+SMTP_PORT = 587
+
+
+def send_email(email, contact, message):
+    missing_configs = []
+    if not EMAIL_ADDRESS:
+        missing_configs.append("EMAIL_ADDRESS")
+    if not EMAIL_PASSWORD:
+        missing_configs.append("EMAIL_PASSWORD")
+    if not RECIPIENT_EMAIL:
+        missing_configs.append("RECIPIENT_EMAIL")
+    if not SMTP_SERVER:
+        missing_configs.append("SMTP_SERVER")
+    if not SMTP_PORT:
+        missing_configs.append("SMTP_PORT")
+
+    if missing_configs:
+        print(
+            f"Email configuration missing: {', '.join(missing_configs)}. Check .env file."
+        )
+        return False
+
+    msg = MIMEMultipart()
+    msg["From"] = EMAIL_ADDRESS
+    msg["To"] = RECIPIENT_EMAIL
+    msg["Subject"] = "New Query Submission from AI Infinite"
+
+    if contact is not None:
+        body = f"""
+        Hello,
+
+        A new query has been received through the AI Infinite contact form:
+
+        Email: {email}
+        Contact Number: {contact or 'Not provided'}
+        Message: {message}
+
+        Thank you,
+        AI Infinite Team
+        """
+    else:
+        body = message
+
+    msg.attach(MIMEText(body, "plain"))
+
+    try:
+        server = smtplib.SMTP(SMTP_SERVER, int(SMTP_PORT))
+        server.starttls()
+        server.login(EMAIL_ADDRESS, EMAIL_PASSWORD)
+        server.sendmail(EMAIL_ADDRESS, RECIPIENT_EMAIL, msg.as_string())
+        server.quit()
+        print("Email sent successfully")
+        return True
+    except Exception as e:
+        print(f"Email error: {e}")
+        return False
+
+
+@app.route("/submit", methods=["POST"])
+def submit_query():
+    print("Received form submission")
+    email = request.form.get("email")
+    contact = request.form.get("contact")
+    message = request.form.get("message")
+    print(f"Form data: email={email}, contact={contact}, message={message}")
+
+    if not email or not message:
+        print("Validation failed: Email or message missing")
+        return (
+            jsonify({"success": False, "message": "Email and message are required"}),
+            400,
+        )
+
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT INTO contact_queries (email, contact, message) VALUES (%s, %s, %s)",
+            (email, contact, message),
+        )
+        conn.commit()
+        print("Query stored in database")
+    except Exception as e:
+        print(f"Database error: {e}")
+        return jsonify({"success": False, "message": "Error storing query"}), 500
+    finally:
+        cursor.close()
+        conn.close()
+
+    if send_email(email, contact, message):
+        print("Email sent successfully")
+        return jsonify({"success": True, "message": "Query stored and email sent"})
+    else:
+        print("Email sending failed")
+        return (
+            jsonify(
+                {"success": False, "message": "Query stored, but failed to send email"}
+            ),
+            200,
+        )
+
+
+@app.route("/schedule", methods=["POST"])
+def schedule_demo():
+    print("Received demo submission")
+    name = request.form.get("name")
+    email = request.form.get("company-email")
+    timezone = request.form.get("timezone")
+
+    if not email:
+        print("Validation failed: Email missing")
+        return jsonify({"success": False, "message": "Email is required"}), 400
+
+    message = (
+        "Hello,\n"
+        "A new demo request has been issued by\n\n"
+        f"Name: {name or 'Not provided'}\n"
+        f"Email: {email}\n"
+        f"Timezone: {timezone or 'Not specified'}\n\n"
+        "Thank you."
+    )
+
+    if send_email(email, None, message):
+        print("Demo email sent successfully")
+        return jsonify(
+            {"success": True, "message": "Demo request processed and email sent"}
+        )
+    else:
+        print("Demo email sending failed")
+        return (
+            jsonify(
+                {
+                    "success": False,
+                    "message": "Demo request processed, but failed to send email",
+                }
+            ),
+            200,
+        )
+
+
+@app.route("/home")
+def home_logged_in():
+    if "user" not in session:
+        print("User not in session. Redirecting to index.")
+        return redirect(url_for("index"))
+    print(f"User is in session: {session['user']}")
+    return render_template("home.html", logged_in=True, username=session["user"])
+
+
+@app.context_processor
+def inject_user():
+    return {"logged_in": "user" in session, "username": session.get("user")}
+
+
+from datetime import datetime
+
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=8080, debug=True)
