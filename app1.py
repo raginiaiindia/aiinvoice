@@ -1,11 +1,12 @@
 from dotenv import load_dotenv
-
+from prompts import input_prompt
 load_dotenv()
-
+import re
 import io
 import json
 import os
 from datetime import datetime, timedelta
+import unicodedata
 import secrets
 import time
 import bcrypt
@@ -24,9 +25,9 @@ from flask import (
 )
 import pandas as pd
 from werkzeug.utils import secure_filename
-
 from PIL import Image
-import google.generativeai as genai
+from vertexai.generative_models import GenerativeModel, Part
+import vertexai
 import logging
 from functools import wraps
 from flask_cors import CORS
@@ -35,32 +36,30 @@ import ssl
 import mysql.connector
 from mysql.connector import pooling
 from datetime import timedelta
-
 utc_now = datetime.utcnow()
-import vertexai
-from vertexai.preview.generative_models import GenerativeModel
 from pdf2image import convert_from_path
-from vertexai.preview.generative_models import Part
-
-# to add in app.py
+from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
+# ================================================================
+# ✅ UTILITY — normalize unicode to plain ASCII
+# ================================================================
+def normalize_text(value):
+    """Convert unicode characters to closest ASCII. ä→a, é→e, ü→u"""
+    if not value or not isinstance(value, str):
+        return value
+    normalized = unicodedata.normalize("NFKD", value)
+    return normalized.encode("ascii", "ignore").decode("ascii").strip()
 
+# from google import genai
 app = Flask(__name__)
 from zoneinfo import ZoneInfo
-
-# from vision_ocr import extract_text_from_pdf, extract_text_from_image
-
-
-# Load environment variables
-# load_dotenv()
-# vertexai.init(project="aiinfinite", location="us-central1")
-
-# model = GenerativeModel("gemini-1.0-pro-vision")  # or flash
-# Configure the Google Gemini API
-genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
+# Initialize Vertex AI
+vertexai.init(project="project-d38b6d1d-39e8-4b14-a43", location="us-central1")
 
 # Initialize the Gemini model
-model = genai.GenerativeModel("gemini-3-pro-preview")
+model = GenerativeModel("gemini-2.5-flash")
+
+
 
 # Allowed file extensions
 ALLOWED_EXTENSIONS = {"pdf", "jpeg", "jpg", "png"}
@@ -79,7 +78,7 @@ MYSQL_CONFIG = {
     "database": os.getenv("MYSQL_DB"),
     "auth_plugin": "mysql_native_password",
     "pool_name": "my_pool",
-    "pool_size": 5,
+    "pool_size": 20,
     "autocommit": True,
     "buffered": True,
 }
@@ -87,8 +86,15 @@ MYSQL_CONFIG = {
 # Connection Pool
 cnxpool = mysql.connector.pooling.MySQLConnectionPool(**MYSQL_CONFIG)
 
-print("Sender:", os.getenv("EMAIL_ADDRESS"))
-print("Password:", os.getenv("EMAIL_PASSWORD"))
+# print("Sender:", os.getenv("EMAIL_ADDRESS"))
+# print("Password:", os.getenv("EMAIL_PASSWORD"))
+def format_currency(value, symbol="₹"):
+    if value is None:
+        return None
+    try:
+        return f"{symbol} {float(value):.2f}"
+    except:
+        return value
 
 
 def get_db_connection():
@@ -107,13 +113,11 @@ def fix_existing_limits():
     cursor.close()
     conn.close()
     print("User limits updated to 50")
-
-
 def init_db():
-    conn = get_db_connection()
-    cursor = conn.cursor()
+       conn = get_db_connection()
+       cursor = conn.cursor()
 
-    cursor.execute(
+       cursor.execute(
         """
     CREATE TABLE IF NOT EXISTS contact_queries (
         id INT AUTO_INCREMENT PRIMARY KEY,
@@ -124,8 +128,8 @@ def init_db():
     )
     """
     )
-
-    cursor.execute(
+    
+       cursor.execute(
         """
     CREATE TABLE IF NOT EXISTS users (
         id INT AUTO_INCREMENT PRIMARY KEY,
@@ -143,7 +147,7 @@ def init_db():
     """
     )
 
-    cursor.execute(
+       cursor.execute(
         """
     CREATE TABLE IF NOT EXISTS extraction_history (
         id INT AUTO_INCREMENT PRIMARY KEY,
@@ -157,19 +161,19 @@ def init_db():
     """
     )
 
-    cursor.execute(
+       cursor.execute(
         """
     CREATE TABLE IF NOT EXISTS api_keys (
         id INT AUTO_INCREMENT PRIMARY KEY,
         user_id INT,
         api_key VARCHAR(255) UNIQUE,
-        created_at DATETIME,
+         created_at DATETIME,
         FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
     )
     """
     )
 
-    cursor.execute(
+       cursor.execute(
         """
     CREATE TABLE IF NOT EXISTS api_usage (
         id INT AUTO_INCREMENT PRIMARY KEY,
@@ -183,12 +187,12 @@ def init_db():
     )
 
     # ensure admin user exists
-    cursor.execute(
+       cursor.execute(
         "SELECT * FROM users WHERE username = 'Niraj' AND email = 'connect.aiindia@gmail.com'"
     )
-    admin_user = cursor.fetchone()
-    if not admin_user:
-        cursor.execute(
+       admin_user = cursor.fetchone()
+       if not admin_user:
+          cursor.execute(
             """
             INSERT INTO users (username, email, password, role)
             VALUES (
@@ -199,10 +203,10 @@ def init_db():
             )
         """
         )
-        conn.commit()
+          conn.commit()
 
-    cursor.close()
-    conn.close()
+          cursor.close()
+          conn.close()
 
 
 # Re-initialize the database
@@ -216,7 +220,6 @@ init_db()
 app = Flask(__name__)
 CORS(app)
 app.secret_key = os.getenv("FLASK_SECRET_KEY", default="fallback-secret-key")
-
 UPLOAD_FOLDER = "uploads"
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 app.config["UPLOAD_FOLDER"] = UPLOAD_FOLDER
@@ -303,307 +306,393 @@ def pdf_to_images_pymupdf(file_path):
         image = Image.frombytes(mode, [pix.width, pix.height], pix.samples)
         images.append(image)
     return images
+HEADER_FIELDS = [
+    "invoice_id",
+    "invoice_number",
+    "invoice_date",
+    "due_date",
+    "customer_name",
+    "customer_gstin",
+    "seller_name",
+    "seller_gstin",
+    "currency_code",
+    "PO_number",
+    "DC_date",
+    "DC_number",
+    "invoice_amount",
+    "round_off",
+    "total_gst_rate",
+    "total_quantity",
+    "total_cgst_rate",
+    "total_cgst_amount",
+    "total_sgst_rate",
+    "total_sgst_amount",
+    "total_igst_rate",
+    "total_igst_amount",
+    "total_gst_amount"
+    
+]
+def generate_invoice_id(conn, invoice_source):
+    prefix = "M" if invoice_source == "manual" else "E"
+    today  = datetime.now().strftime("%Y%m%d")
+    cursor = conn.cursor()
 
-
-def extract_invoice_fields(file_path):
-    file_ext = os.path.splitext(file_path)[1].lower()
     try:
+        # ✅ Use SELECT FOR UPDATE — locks the row
+        # ALL other requests block here until this completes
+        conn.start_transaction()
+
+        cursor.execute(
+            """
+            SELECT last_seq, last_date 
+            FROM invoice_id_lock 
+            WHERE id = 1 
+            FOR UPDATE
+            """
+        )
+        row = cursor.fetchone()
+
+        last_seq  = row[0] if row else 0
+        last_date = row[1] if row else ""
+
+        # ✅ Reset sequence if new day
+        if last_date != today:
+            new_seq = 1
+        else:
+            new_seq = last_seq + 1
+
+        # ✅ Update lock table with new sequence
+        cursor.execute(
+            """
+            UPDATE invoice_id_lock 
+            SET last_seq = %s, last_date = %s
+            WHERE id = 1
+            """,
+            (new_seq, today)
+        )
+
+        conn.commit()  # ✅ releases FOR UPDATE lock
+
+        invoice_id = f"{prefix}{today}{str(new_seq).zfill(3)}"
+        print(f"✅ Generated invoice_id: {invoice_id}")
+        return invoice_id
+
+    except Exception as e:
+        conn.rollback()
+        print(f"❌ Invoice ID error: {e}")
+        # Fallback
+        import random
+        return f"{prefix}{today}{str(random.randint(100,999))}"
+
+    finally:
+        cursor.close()
+
+
+
+def extract_invoice_fields(file_path,invoice_source="electronic"):
+    try:
+        # ===============================
+        # 🔥 STEP 1: CREATE DB CONNECT
+        # ===============================
+        conn = get_db_connection()
+
+        # ===============================
+        # 🔥 STEP 2: GENERATE invoice_id
+        # ===============================
+        invoice_id = generate_invoice_id(conn, invoice_source)
+
+        # ===============================
+        # 🔹 STEP 3: Convert PDF to images
+        # ===============================
+        file_ext = os.path.splitext(file_path)[1].lower()
+
         if file_ext == ".pdf":
             images = pdf_to_images_pymupdf(file_path)
         else:
             images = [Image.open(file_path)]
-        input_prompt = """
-    
-You are an OCR-based invoice extraction engine with LIMITED,
-EXPLICITLY ALLOWED NORMALIZATION for expiry date ONLY.
 
-Character-level copying is mandatory for ALL fields
-EXCEPT expiry_date where special rules apply.
+        import uuid
+        all_pages_data = []
 
-=====================
-CORE EXTRACTION RULES
-=====================
-1. Do NOT guess or infer values EXCEPT where explicitly allowed.
-2. Preserve original casing, spacing, and punctuation.
-3. Never calculate prices, totals, taxes, or quantities
-   EXCEPT total_quantity which is explicitly allowed.
-4. Never merge multiple item rows into one.
-5. Invoice grand total must be extracted exactly as shown
-   and labeled as "invoice_amount".
-6. Round Off value must be extracted exactly as shown
-   and labeled as "round_off".
-7. Output ONLY valid JSON (no markdown, no explanation).
+        for img in images:
+            # ✅ Only image sent — prompt already in system_instruction
+            # response = model.generate_content(img)
+            
 
-=====================
-FIELD ISOLATION RULES
-=====================
-Customer GSTIN ≠ Seller GSTIN
-Item Code ≠ HSN ≠ SKU ≠ Product Code ≠ Batch Number
-Batch Number must NEVER be merged or reused.
-
-=====================
-BATCH-LEVEL ITEM RULES (CRITICAL – FINAL)
-=====================
-1. Each DISTINCT batch number MUST be extracted
-   as a SEPARATE item object.
-
-2. If the same product appears with multiple batches:
-   - Create ONE item entry PER batch.
-   - Quantity must belong ONLY to that batch.
-
-3. SINGLE-BATCH ITEM RULE:
-   If an item row contains:
-   - ONLY ONE batch number
-   - AND quantity, unit_price (rate), AND total_price
-     are ALL explicitly present in the invoice,
-   THEN:
-   - Extract total_price EXACTLY as shown.
-   - Do NOT calculate or modify total_price.
-
-4. MULTI-BATCH ITEM RULE:
-   If a product appears with MULTIPLE batch numbers:
-   - Create ONE item object PER batch.
-   - If total_price is NOT explicitly shown per batch:
-       → total_price MUST be calculated as:
-         quantity × unit_price
-   - This calculation is ALLOWED ONLY at item level.
-
-5. DO NOT calculate, infer, or mention:
-   - Any combined total across items
-   - Any invoice-level or product-level total
-   - Any summed batch total
-
-6. Each item object MUST contain ONLY its own
-   batch-level total_price.
-
-7. Batch number MUST be extracted ONLY from item rows.
-
-
-Accepted batch labels:
-  "Batch", "Batch No", "Batch No.", "B.No", "Lot", "Lot No"
-
-=====================
-QUANTITY RULES
-=====================
-1. Extract quantity EXACTLY as shown per batch row.
-2. Do NOT normalize, round, or infer quantities.
-3. If quantity is unclear → return null.
-4. total_quantity is the SUM of all item quantities
-   ONLY if quantities are numeric and clear.
-5. If any quantity is unclear → total_quantity must be null.
-
-=====================
-BATCH NUMBER NORMALIZATION RULES (NEW)
-=====================
-1. If batch_number contains any special character
-   (anything other than A–Z, a–z, 0–9):
-   - Replace EACH special character with "-" (hyphen).
-2. Do NOT remove letters or digits.
-3. Do NOT collapse multiple hyphens into one.
-4. Do NOT modify casing.
-
-=====================
-REFERENCE NUMBER RULES (NEW)
-=====================
-1. Extract Part Number / Part No / P.No ONLY as "reference_number".
-2. Do NOT extract Part Number as item_code.
-3. Reference Number must be taken ONLY from labels such as:
-   "Part No", "Part Number", "P.No", "Ref No", "Reference No"
-4. Reference Number must NOT be reused for any other field.
-
-=====================
-ITEM-LEVEL EXPIRY RULES (EXPLICIT INFERENCE ALLOWED)
-=====================
-Extract expiry ONLY from ITEM ROWS.
-Expiry must be on the SAME ROW as:
-  item description OR item code OR batch number.
-
-Accepted expiry labels:
-  "EXP", "Exp", "Expiry", "Expiry Date",
-  "BB", "Best Before", "Use Before"
-  =====================
-INVOICE & DUE DATE NORMALIZATION RULES (MANDATORY)
-=====================
-invoice_date and due_date MUST be normalized to:
-
-DD/MM/YYYY
-
-Accepted input formats include:
-DD-MM-YYYY
-DD/MM/YYYY
-YYYY-MM-DD
-DD Mon YYYY
-Mon DD, YYYY
-
-Rules:
-1. Extract the date EXACTLY from its labeled field.
-2. Normalize ONLY the format, not the value.
-3. If day, month, or year is missing or unclear → return null.
-4. If normalization fails → add field name to uncertain_fields.
-
-=====================
-EXPIRY DATE NORMALIZATION RULES (MANDATORY)
-=====================
-Expiry may appear as:
-MM/YY   (06/28)
-MM/YYYY (06/2028)
-YYYY    (2028)
-
-When expiry is in MM/YY format:
-1. Take MONTH from expiry (MM).
-2. Take YEAR CENTURY from invoice_date or due_date.
-3. Combine century + YY to form YYYY.
-4. Set DAY to LAST CALENDAR DAY of that month
-   (February → 28 or 29 as applicable).
-
-When expiry is in MM/YYYY:
-Set DAY to LAST CALENDAR DAY of that month.
-
-When expiry is YEAR only:
-Set expiry date to 31/12/YYYY.
-
-FINAL expiry_date format:
-DD/MM/YYYY
-
-Do NOT output raw expiry text.
-Do NOT ask for clarification.
-=====================
-ITEM CODE EXTRACTION FROM DESCRIPTION (MANDATORY WITH EXAMPLE)
-=====================
-1. If the item description STARTS WITH or CONTAINS
-   an alphanumeric code separated by hyphens or slashes,
-   and the code is followed by brackets, parentheses,
-   or descriptive text, that code MUST be extracted
-   as "item_code".
-
-2. This applies EVEN IF there is NO explicit
-   "Item Code" / "PCode" / "Product Code" label.
-
-3. The extracted code MUST be copied EXACTLY
-   as it appears (character-level).
-
-4. Do NOT treat such codes as reference_number.
-
-5. Do NOT infer or generate item_code if no clear
-   standalone code is present.
-
----------------------
-EXPLICIT POSITIVE EXAMPLE
----------------------
-
-If item description is:
-"SR-02-0497 (Vygon P M Line 200 cm)"
-
-Then output MUST be:
-"item_code": "SR-02-0497"
-
-And description MUST remain:
-"SR-02-0497 (Vygon P M Line 200 cm)"
-
----------------------
-NEGATIVE EXAMPLES
----------------------
-1. "Vygon P M Line 200 cm" → item_code = null
-2. "Size SR 02 0497 Tube" → item_code = null (not clearly isolated)
-3. "Batch SR-02-0497" → NOT item_code (batch context)
-
-=====================
-DATE SOURCE PRIORITY
-=====================
-Use invoice_date first.
-If missing, use due_date.
-If both are missing → expiry_date must be null
-and added to uncertain_fields.
-
-=====================
-VALIDATION RULES
-=====================
-Year MUST be ≥ invoice year.
-If expiry < invoice_date → INVALID.
-
-=====================
-NUMBER RULES
-=====================
-Do NOT correct OCR mistakes.
-If digits are unclear → return null.
-
-=====================
-ROUND OFF RULES
-=====================
-1. Extract Round Off ONLY if explicitly present.
-2. Accepted labels:
-   "Round Off", "RoundOff", "R/O", "R.Off"
-3. Do NOT calculate or infer Round Off.
-4. If label exists but value is unclear → return null
-   and add "round_off" to uncertain_fields.
-
-=====================
-OUTPUT RULES
-=====================
-1. Always include uncertain_fields.
-2. If expiry label exists but cannot be resolved →
-   add "items[i].expiry_date" to uncertain_fields.
-3. Do NOT include empty objects or arrays.
-
-=====================
-OUTPUT JSON STRUCTURE
-=====================
-
-{
-  "invoice_number": "<Invoice Number>",
-  "invoice_date": "<Invoice Date>",
-  "due_date": "<Due Date>",
-
-  "customer_name": "<Customer Name>",
-  "customer_gstin": "<Customer GSTIN>",
-
-  "seller_name": "<Seller Name>",
-  "seller_gstin": "<Seller GSTIN>",
-
-  "items": [
-    {
-      "description": "<Item Description>",
-      "batch_number": "<Batch Number>",
-      "quantity": <Batch Quantity>,
-      "unit_price": <Unit Price>,
-      "total_price": <Total Price>,
-      "reference_number": "<Reference Number>",
-      "hsn_sac": "<HSN/SAC>",
-      "item_code": "<Item Code>",
-      "expiry_date": "<DD/MM/YYYY>"
-    }
-  ],
-
-  "total_quantity": <Sum of all item quantities>,
-  "round_off": <Round Off value>,
-  "invoice_amount": <Inv amount>,
-
-  "uncertain_fields": []
-
-}
- """
-        all_pages_data = {}
-        for i, img in enumerate(images):
-            response = model.generate_content([input_prompt, img])
+           
+            # Convert PIL image to bytes for Vertex AI
+            buffer = io.BytesIO()
+            img.save(buffer, format="PNG")
+            image_bytes = buffer.getvalue()
+            image_part = Part.from_data(image_bytes, mime_type="image/png")
+            response = model.generate_content([input_prompt, image_part])
             response_text = response.text.strip("```").strip()
+            
+            
             if response_text.lower().startswith("json"):
                 response_text = response_text[4:].strip()
+
+
             if "}" in response_text:
-                json_end_index = response_text.rfind("}") + 1
-                response_text = response_text[:json_end_index]
+                response_text = response_text[: response_text.rfind("}") + 1]
+
             try:
                 page_data = json.loads(response_text)
-                all_pages_data[f"page_{i+1}"] = page_data
+                 
+
+                # 🔴 CHANGE 2: remove page_x
+                all_pages_data.append(page_data)
+        
             except json.JSONDecodeError as e:
-                print(f"JSON parsing error on page {i+1}: {e}")
-                all_pages_data[f"page_{i+1}"] = {
+                print(f"JSON parsing error: {e}")
+                all_pages_data.append({
                     "error": "Invalid JSON returned from Gemini",
                     "details": response_text,
-                }
-        return all_pages_data
+                })
+            cgst_rates, sgst_rates, igst_rates = set(), set(), set()
+        print("🔍 ALL PAGES DATA:", all_pages_data)
+        if all_pages_data:
+             print("🔍 FIRST PAGE KEYS:", all_pages_data[0].keys())
+             print("🔍 ITEMS:", all_pages_data[0].get("items"))
+
+        
+
+        # ===================================================
+        # 🔥 ADD COMPLETE GST PROCESSING CODE RIGHT HERE
+        # ===================================================
+        from decimal import Decimal, ROUND_HALF_UP
+
+        def round2(value):
+          return float(
+            Decimal(str(value)).quantize(
+              Decimal("0.01"),
+                rounding=ROUND_HALF_UP
+        )
+        
+)      
+        def safe_float(value):
+          if value is None:
+            return 0.0
+          try:
+            # Strip everything except digits, dot, minus
+            cleaned = re.sub(r"[^\d.\-]", "", str(value).strip())
+            return float(cleaned) if cleaned else 0.0
+          except:
+             return 0.0
+
+        def process_gst(all_pages_data, final_header):
+             final_header["total_cgst_amount"] = 0
+             final_header["total_sgst_amount"] = 0
+             final_header["total_igst_amount"] = 0
+             final_header["total_gst_amount"] = 0
+
+             total_cgst_amount = 0
+             total_sgst_amount = 0
+             total_igst_amount = 0
+
+             cgst_rates = set()
+             sgst_rates = set()
+             igst_rates = set()
+
+             
+
+             for page in all_pages_data:
+                # 🔥 Handle both "items" and "Items"
+                 items = page.get("items") or page.get("Items") or []
+                 
+                 for item in items:
+                   print("DEBUG qty:", repr(item.get("quantity")), 
+                   "unit_price:", repr(item.get("unit_price")),
+                   "Value:", repr(item.get("Value")),
+                   "cgst_rate:", repr(item.get("cgst_rate")))
+                   qty = safe_float(item.get("quantity"))
+                   unit_price = safe_float(item.get("unit_price"))
+                   total_price = safe_float(item.get("total_price"))
+
+                   discount = safe_float(item.get("Discount"))
+                   value_field = safe_float(item.get("Value"))
+                   # ✅ PRIORITY 1: If Value field exists, use it (most correct)
+                   if value_field > 0:
+                       taxable = round2(value_field)
+                   # ✅ PRIORITY 2: If discount exists, calculate manually
+                   elif discount > 0:
+                       gross = qty * unit_price
+                       taxable = round2(gross - (gross * discount / 100))
+
+                  # ✅ PRIORITY 3: Use total_price
+                   elif total_price > 0:
+                      taxable = round2(total_price)
+
+                  # ✅ FINAL fallback
+                   else:
+                       taxable = round2(qty * unit_price)
+
+
+
+                   item["taxable_value"] = taxable
+
+                   cgst_rate = safe_float(item.get("cgst_rate"))  # ✅ handles None
+                   sgst_rate = safe_float(item.get("sgst_rate"))  # ✅ handles None
+                   igst_rate = safe_float(item.get("igst_rate"))
+                   # ✅ Always recalculate (do NOT depend on Gemini amount)
+                   item["cgst_amount"] = round2(taxable * cgst_rate / 100)
+                   item["sgst_amount"] = round2(taxable * sgst_rate / 100)
+                   item["igst_amount"] = round2(taxable * igst_rate / 100)
+                    #ADD THESE TWO LINES
+                   item["GST_AMT"] = round2(item["cgst_amount"] + item["sgst_amount"] + item["igst_amount"])
+                   item["Gst%"] = round2(cgst_rate + sgst_rate + igst_rate)
+                   total_cgst_amount += item["cgst_amount"]
+                   total_sgst_amount += item["sgst_amount"]
+                   total_igst_amount += item["igst_amount"]
+
+                   if cgst_rate > 0:
+                     cgst_rates.add(cgst_rate)
+                   if sgst_rate > 0:
+                     sgst_rates.add(sgst_rate)
+                   if igst_rate > 0:
+                     igst_rates.add(igst_rate)
+
+            # 🔥 Normalize items key
+                 page["items"] = items
+                
+
+             final_header["total_cgst_amount"] = round2(total_cgst_amount)
+             final_header["total_sgst_amount"] = round2(total_sgst_amount)
+             final_header["total_igst_amount"] = round2(total_igst_amount)
+
+             final_header["total_gst_amount"] = round2(
+        total_cgst_amount + total_sgst_amount + total_igst_amount
+    )
+             
+             if len(cgst_rates) == 1:
+               final_header["total_cgst_rate"] = list(cgst_rates)[0]
+
+             if len(sgst_rates) == 1:
+               final_header["total_sgst_rate"] = list(sgst_rates)[0]
+
+             if len(igst_rates) == 1:
+               final_header["total_igst_rate"] = list(igst_rates)[0]
+
+    # TOTAL GST RATE
+             if final_header.get("total_igst_rate"):
+               final_header["total_gst_rate"] = final_header["total_igst_rate"]
+             elif final_header.get("total_cgst_rate") and final_header.get("total_sgst_rate"):
+               final_header["total_gst_rate"] = round2(
+                   final_header["total_cgst_rate"] +
+                   final_header["total_sgst_rate"]
+        )
+
+
+             return all_pages_data, final_header
+        print("🔍 ALL PAGES DATA:", all_pages_data)
+        # ===============================
+        # BUILD FINAL HEADER
+        # ===============================
+        final_header = {field: None for field in HEADER_FIELDS}
+
+        for page in all_pages_data:
+            for field in HEADER_FIELDS:
+                value = page.get(field)
+
+                if isinstance(value, dict):
+                    value = value.get("value")
+
+                if final_header[field] in (None, "", 0) and value not in (None, "", 0):
+                    final_header[field] = value
+                   
+        all_pages_data, final_header = process_gst(all_pages_data, final_header)
+        
+
+        # # ===============================
+        # # 🔹 TOTAL GST RATE (ADD HERE)
+        # # ===============================
+        # total_gst_rate = None
+        # cgst = final_header.get("total_cgst_rate")
+        # sgst = final_header.get("total_sgst_rate")
+        # igst = final_header.get("total_igst_rate")
+
+        # if igst and igst > 0:
+        #    total_gst_rate = igst
+        # elif cgst and sgst:
+        #     total_gst_rate = round(cgst + sgst, 2)
+
+        # final_header["total_gst_rate"] = total_gst_rate
+
+        # # ===============================
+        # # 🔹 TOTAL GST AMOUNT
+        # # ===============================
+        # final_header["total_gst_amount"] = round(
+        #     (final_header.get("total_cgst_amount") or 0)
+        #     + (final_header.get("total_sgst_amount") or 0)
+        #     + (final_header.get("total_igst_amount") or 0),
+        #     2,
+        # )
+
+
+       
+        # ===============================
+        #   STEP 5: BUILD FINAL OUTPUT
+        # ===============================
+        extracted_data = {
+            **final_header,
+            "items": [
+                item
+                for page in all_pages_data
+               for item in (page.get("items") or page.get("Items") or [])
+            ],
+        }
+        # ===============================
+        # 🔹 DETECT & SET CURRENCY CODE
+        # ===============================
+        currency_code = None
+
+        header_currency = str(extracted_data.get("currency_code") or "").upper()
+
+        if header_currency in ["INR", "USD", "EUR", "GBP", "JPY", "SGD"]:
+            currency_code = header_currency
+
+        invoice_amount = str(extracted_data.get("invoice_amount") or "")
+
+        if not currency_code:
+            if "₹" in invoice_amount:
+                currency_code = "INR"
+            elif "$" in invoice_amount:
+                currency_code = "USD"
+            elif "€" in invoice_amount:
+                currency_code = "EUR"
+            elif "£" in invoice_amount:
+                currency_code = "GBP"
+            elif "¥" in invoice_amount:
+                currency_code = "JPY"
+
+        if not currency_code:
+            currency_code = "INR"
+
+        extracted_data["currency_code"] = currency_code
+
+        # ✅ ADD THIS BLOCK — normalize unicode in all string fields
+        for key, value in extracted_data.items():
+          if isinstance(value, str):
+            extracted_data[key] = normalize_text(value)
+
+# Also normalize item descriptions
+        for item in extracted_data.get("items", []):
+         for key, value in item.items():
+           if isinstance(value, str):
+            item[key] = normalize_text(value)
+
+        
+# 🔥 Inject invoice_id
+        extracted_data["invoice_id"] = invoice_id
+# 🔥 CLOSE CONNECTION
+        conn.close()
+        return extracted_data
     except Exception as e:
-        print(f"Error during invoice extraction: {e}")
-        return {"error": f"Error: {str(e)}"}
+        print("Extraction error:", e)
+        return {"error": str(e)}
+
+
+
 
 
 @app.route("/process-invoice", methods=["POST"])
@@ -612,23 +701,25 @@ def process_invoice():
     try:
         if "file" not in request.files:
             return jsonify({"error": "No file part"}), 400
+
         file = request.files["file"]
+
         if file.filename == "":
             return jsonify({"error": "No selected file"}), 400
+
         if file and allowed_file(file.filename):
             filename = secure_filename(file.filename)
             filepath = os.path.join(app.config["UPLOAD_FOLDER"], filename)
             file.save(filepath)
-            upload_message = {"message": f"File uploaded successfully: {filename}"}
-            extracted_data = extract_invoice_fields(filepath)
 
-            if extracted_data:
-                return jsonify(extracted_data), 200
-            else:
-                logging.error(f"Failed to extract invoice data from {filename}")
-                return jsonify({"error": "Failed to extract invoice data"}), 500
-        else:
-            return jsonify({"error": "Invalid file type"}), 400
+            invoice_source = request.form.get("invoice_source", "electronic")
+
+            extracted_data = extract_invoice_fields(filepath, invoice_source)
+
+            return jsonify(extracted_data), 200
+
+        return jsonify({"error": "Invalid file type"}), 400
+
     except Exception as e:
         logging.error(f"Error during upload or extraction: {e}")
         return jsonify({"error": "Internal Server Error"}), 500
@@ -649,7 +740,7 @@ def get_usage_count():
         return jsonify(
             {
                 "api_key": api_key,
-                "usage_count": usage_entry["count"],
+                 "usage_count": usage_entry["count"],
                 "last_used": usage_entry["last_used"].strftime("%Y-%m-%d"),
             }
         )
@@ -701,7 +792,6 @@ def admin_dashboard():
         # fetch all api_keys
         cursor.execute("SELECT * FROM api_keys")
         api_keys = cursor.fetchall()
-
         cursor.close()
         conn.close()
 
@@ -756,7 +846,7 @@ def update_user_limit():
                     400,
                 )
         except ValueError:
-            return jsonify({"error": "Account limit must be a valid integer"}), 400
+             return jsonify({"error": "Account limit must be a valid integer"}), 400
         conn = get_db_connection()
         cursor = conn.cursor(dictionary=True)
         sql = "SELECT * FROM users WHERE id = %s"
@@ -860,7 +950,7 @@ def validate_phone_number(raw_phone, default_region="IN"):
         e164 = phonenumbers.format_number(pn, phonenumbers.PhoneNumberFormat.E164)
         return e164, None
     except NumberParseException as e:
-        return None, str(e)
+         return None, str(e)
 
 
 @app.route("/signup", methods=["GET", "POST"])
@@ -928,16 +1018,22 @@ def forgot_password():
         except Exception as e:
             flash(f"Error: {e}")
     return render_template("appforget.html")
-
+ 
 
 from flask import render_template
 from zoneinfo import ZoneInfo
 
 
-def to_ist(utc_time):
-    return utc_time.replace(tzinfo=ZoneInfo("UTC")).astimezone(ZoneInfo("Asia/Kolkata"))
+#def to_ist(utc_time):
+#    return utc_time.replace(tzinfo=ZoneInfo("UTC")).astimezone(ZoneInfo("Asia/Kolkata"))
 
-
+def to_ist(utc_dt):
+    # If naive, assume it's UTC
+    if utc_dt.tzinfo is None:
+        utc_dt = utc_dt.replace(tzinfo=ZoneInfo("UTC"))
+    # Convert to IST
+    ist_dt = utc_dt.astimezone(ZoneInfo("Asia/Kolkata"))
+    return ist_dt
 UPLOAD_FOLDER = os.path.join(os.getcwd(), "uploads", "invoices")
 
 
@@ -956,9 +1052,8 @@ def view_invoice(invoice_id):
         FROM extraction_history
         WHERE id = %s AND user_id = %s
         """,
-        (invoice_id, user_id),
+        (invoice_id, user_id)
     )
-
     invoice = cursor.fetchone()
 
     cursor.close()
@@ -968,16 +1063,20 @@ def view_invoice(invoice_id):
         return "Invoice not found", 404
 
     if not invoice["extracted_data"]:
-        return "JSON extraction not available for this invoice", 404
+     return "JSON extraction not available for this invoice", 404
 
     extracted_json = json.loads(invoice["extracted_data"])
 
+
     return render_template(
         "view_invoice_json.html",
-        invoice_json=json.dumps(extracted_json, indent=4),
+        invoice_json=json.dumps(extracted_json,indent=4),
         image_name=invoice["image_name"],
         timestamp=invoice["timestamp"],
     )
+
+    
+
 
 
 @app.route("/invoice-history")
@@ -997,7 +1096,7 @@ def invoice_history_page():
         AND extracted_data IS NOT NULL
         ORDER BY timestamp DESC
         """,
-        (user_id,),
+        (user_id,)
     )
 
     rows = cursor.fetchall()
@@ -1007,16 +1106,14 @@ def invoice_history_page():
     invoice_history = []
 
     for row in rows:
-        invoice_history.append(
-            {
-                "id": row["id"],
-                "timestamp_str": row["timestamp"].strftime("%d-%m-%Y %I:%M:%S %p"),
-                "image_name": row["image_name"],
-            }
-        )
+
+     invoice_history.append({
+            "id": row["id"],
+            "timestamp_str": row["timestamp"].strftime("%d-%m-%Y %I:%M:%S %p"),
+            "image_name": row["image_name"],
+        })
 
     return render_template("view_history.html", invoice_history=invoice_history)
-
 
 @app.route("/invoice-json/<int:invoice_id>")
 def invoice_json(invoice_id):
@@ -1033,7 +1130,7 @@ def invoice_json(invoice_id):
         FROM extraction_history
         WHERE id = %s AND user_id = %s
         """,
-        (invoice_id, user_id),
+        (invoice_id, user_id)
     )
 
     row = cursor.fetchone()
@@ -1042,11 +1139,11 @@ def invoice_json(invoice_id):
     conn.close()
     if not row or not row["extracted_data"]:
         return "Extraction not available", 404
+    
 
     extracted_data = json.loads(row["extracted_data"])
 
     return render_template("view_invoice_json.html", extracted_data=extracted_data)
-
 
 @app.route("/reset_password", methods=["GET", "POST"])
 def reset_password():
@@ -1063,7 +1160,6 @@ def reset_password():
 
             sql = "UPDATE users SET password = %s WHERE email = %s"
             cursor.execute(sql, (new_password, session["reset_email"]))
-
             conn.commit()
             cursor.close()
             conn.close()
@@ -1076,14 +1172,34 @@ def reset_password():
             flash(f"Error: {e}")
 
     return render_template("appreset.html")
+def get_user_from_db(login_input, password):
+    conn = get_db_connection()
+    cursor = conn.cursor(dictionary=True)
 
+    cursor.execute(
+        """
+        SELECT * FROM users
+        WHERE (username = %s OR email = %s)
+        """,
+        (login_input, login_input),
+    )
+
+    user = cursor.fetchone()
+
+    cursor.close()
+    conn.close()
+
+    # password check (plain text as per your current system)
+    if user and user["password"] == password:
+        return user
+
+    return None
 
 @app.route("/login", methods=["GET", "POST"])
 def login():
     if request.method == "POST":
-        login_input = request.form["username"]
-        password = request.form["password"]
-        remember = request.form.get("remember")
+        login_input = request.form.get("username")
+        password = request.form.get("password")
 
         conn = get_db_connection()
         cursor = conn.cursor(dictionary=True)
@@ -1099,48 +1215,28 @@ def login():
 
         if user and password == user["password"]:
             session.clear()
-            session.permanent = True if remember == "yes" else False
 
-            session["user_id"] = user["id"]  # ✅ ADD THIS
-            session["user"] = user["username"]
+            session["user_id"] = user["id"]
+            session["user"] = user["username"]  # ✅ THIS FIXES IT
             session["role"] = user.get("role", "user")
+            if user["role"] == "dmh":                                                                                 
+                return redirect(url_for("dmh_dashboard"))
+            else:
+                return redirect(url_for("dashboard"))
 
-            return redirect(url_for("dashboard"))
-
-        flash("Invalid login details")
+        flash("Invalid login details", "error")
 
     return render_template("applogin.html")
-
-
-# @app.route("/login", methods=["GET", "POST"])
-# def login():
-#     if request.method == "POST":
-#         email = request.form["email"]
-#         password = request.form["password"]
-
-#         user = get_user_from_db(email, password)  # your existing logic
-
-#         if user:
-#             session["user_id"] = user["id"]
-#             session["role"] = user["role"]  # ⭐ VERY IMPORTANT
-
-#             # redirect based on role
-#             if user["role"] == "dmh":
-#                 return redirect(url_for("dmh_dashboard"))
-#             else:
-#                 return redirect(url_for("dashboard"))
-
-#         return "Invalid credentials"
-
-#     return render_template("applogin.html")
-
-
+import uuid 
 @app.route("/upload-invoice", methods=["POST"])
 def upload_invoice():
     user_id = session.get("user_id")
-
-    if not user_id:
+    role = session.get("role")
+   
+    if not user_id or role not in ["user", "dmh"]:
         return redirect(url_for("login"))
+
+    
 
     # 1️⃣ Get uploaded file
     file = request.files["invoice"]
@@ -1153,7 +1249,7 @@ def upload_invoice():
         images = [Image.open(file_path)]
 
     # 3️⃣ Run OCR pipeline
-    extracted_data = process_invoice(images)
+    extracted_data = extract_invoice_fields(file_path)
 
     if not extracted_data:
         extracted_data = {}
@@ -1163,25 +1259,30 @@ def upload_invoice():
     extraction_type = "invoice"
     image_name = os.path.basename(file_path)
     extracted_json = json.dumps(extracted_data)
-
-    cursor = db.cursor()
     ist_now = datetime.now(ZoneInfo("Asia/Kolkata")).replace(tzinfo=None)
-
+    conn=get_db_connection()
+    cursor = conn.cursor()
+    
     cursor.execute(
         """
         INSERT INTO extraction_history
         (user_id, timestamp, image_name, pages_extracted, extraction_type, extracted_data)
-        VALUES (%s, NOW(), %s, %s, %s, %s)
+        VALUES (%s, %s, %s, %s, %s, %s)
         """,
-        (user_id, image_name, pages_extracted, extraction_type, extracted_json),
+        (
+            user_id,
+            ist_now(),
+            image_name,
+            pages_extracted,
+            extraction_type,
+             extracted_json
+        ),
     )
 
     db.commit()
     cursor.close()
 
     return redirect(url_for("view_history"))
-
-
 import fitz  # PyMuPDF
 from PIL import Image
 import io
@@ -1200,113 +1301,137 @@ def pdf_to_images_pymupdf(pdf_path, dpi=200):
 
     doc.close()
     return images
-
-
 @app.route("/upload_image", methods=["GET", "POST"])
 def upload_image():
-    if "user" not in session:
-        flash("Please login first.", "warning")
+
+    user_id = session.get("user_id")
+    role    = session.get("role")
+
+    if not user_id or role not in ["user", "dmh"]:
         return redirect(url_for("login"))
 
-    conn = None
+    conn   = None
     cursor = None
+
     try:
-        conn = get_db_connection()
+        conn   = get_db_connection()
         cursor = conn.cursor(dictionary=True)
-        sql = "SELECT * FROM users WHERE username = %s"
-        cursor.execute(sql, (session["user"],))
+
+        cursor.execute("SELECT * FROM users WHERE username = %s", (session["user"],))
         user = cursor.fetchone()
+
         if not user:
             flash("User not found.", "error")
             return redirect(url_for("login"))
 
-        total_extracted = user.get("invoices_extracted", 0) + user.get(
-            "passports_extracted", 0
-        )
-        print("USER DATA:", user)
-        print("TOTAL EXTRACTED:", total_extracted)
-        print("ACCOUNT LIMIT FROM DB:", user.get("account_limit"))
-        print("FINAL LIMIT USED:", user.get("account_limit") or 50)
+        total_extracted  = user.get("invoices_extracted", 0) + user.get("passports_extracted", 0)
         extraction_limit = user.get("account_limit") or 50
 
         if total_extracted >= extraction_limit:
-            flash(
-                "You have reached your extraction limit. Contact admin for more.",
-                "error",
-            )
-
+            flash("You have reached your extraction limit.", "error")
             return redirect(url_for("dashboard"))
 
         if request.method == "POST":
+
             if session.get("processing", False):
-                flash(
-                    "Please wait until your current extraction is complete.", "warning"
-                )
+                flash("Please wait until current extraction completes.", "warning")
                 return redirect(url_for("dashboard"))
 
             doc_type = request.form.get("doc_type")
-            if not doc_type or doc_type not in ["invoice", "passport"]:
-                flash("Please select a valid document type.", "error")
+            if doc_type not in ["invoice", "passport"]:
+                flash("Invalid document type.", "error")
                 return redirect(url_for("dashboard"))
 
             file = request.files.get("file")
             if not file or not allowed_file(file.filename):
-                flash("Invalid file type. Please upload a PDF or image.", "error")
+                flash("Invalid file. Upload PDF or Image.", "error")
                 return redirect(url_for("dashboard"))
 
-            filename = secure_filename(file.filename)
-            file_path = os.path.join(app.config["UPLOAD_FOLDER"], filename)
+            # ✅ FIX: Use UUID to avoid filename conflicts on second upload
+            original_filename = secure_filename(file.filename)
+            unique_filename   = f"{uuid.uuid4()}_{original_filename}"
+            file_path         = os.path.join(app.config["UPLOAD_FOLDER"], unique_filename)
             file.save(file_path)
+
             session["processing"] = True
 
-            logging.info(f"Processing {doc_type} file: {filename}")
+            # ============================
+            # INVOICE FLOW
+            # ============================
             if doc_type == "invoice":
-                extracted_data = extract_invoice_fields(file_path)
-                update_field = "invoices_extracted"
-            else:  # doc_type == 'passport'
+                ext            = original_filename.lower()
+                invoice_source = "manual" if ext.endswith((".jpg", ".jpeg", ".png")) else "email"
+
+                # ✅ FIX: Don't generate invoice_id here — extractor generates it
+                # invoice_id is returned inside extracted_data
+                extracted_data = extract_invoice_fields(file_path, invoice_source)
+                invoice_id     = extracted_data.get("invoice_id")
+                update_field   = "invoices_extracted"
+
+            # ============================
+            # PASSPORT FLOW
+            # ============================
+            else:
                 extracted_data = extract_passport_fields(file_path)
-                update_field = "passports_extracted"
+                update_field   = "passports_extracted"
+                invoice_id     = None
+                invoice_source = None
 
             if not extracted_data or "error" in extracted_data:
-                logging.error(
-                    f"Extraction failed for {filename}: {extracted_data.get('error', 'Unknown error')}"
-                )
-                flash(f"Failed to extract data from the {doc_type}.", "error")
+                flash("Extraction failed.", "error")
                 session["processing"] = False
                 return redirect(url_for("dashboard"))
 
             page_count = len(extracted_data)
-            sql_update = f"UPDATE users SET {update_field} = {update_field} + %s WHERE username = %s"
-            cursor.execute(sql_update, (page_count, session["user"]))
-            sql_insert = "INSERT INTO extraction_history (user_id, timestamp, image_name, pages_extracted, extraction_type,extracted_data) VALUES (%s, %s, %s, %s, %s,%s)"
+
             cursor.execute(
-                sql_insert,
+                f"UPDATE users SET {update_field} = {update_field} + %s WHERE username = %s",
+                (page_count, session["user"]),
+            )
+
+            cursor.execute(
+                """
+                INSERT INTO extraction_history
                 (
+                    invoice_id,
+                    invoice_source,
+                    user_id,
+                    timestamp,
+                    image_name,
+                    pages_extracted,
+                    extraction_type,
+                    extracted_data,
+                    file_path
+                )
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                """,
+                (
+                    invoice_id,
+                    invoice_source,
                     user["id"],
                     datetime.now(),
-                    filename,
+                    original_filename,   # ✅ store original name not uuid name
                     page_count,
                     doc_type,
                     json.dumps(extracted_data),
+                    file_path,
                 ),
             )
+
             conn.commit()
-
             session["processing"] = False
-            json_data = json.dumps(extracted_data, indent=4)
-            logging.info(f"Successfully extracted data from {filename}")
-            return render_template("result.html", json_data=json_data)
 
-        return redirect(url_for("dashboard"))
+            return render_template(
+                "result.html",
+                json_data=json.dumps(extracted_data, indent=4),
+                invoice_id=invoice_id,
+            )
 
-    except mysql.connector.Error as db_err:
-        logging.error(f"Database error in upload_image: {db_err}", exc_info=True)
-        flash(f"Database error: {db_err}", "error")
         return redirect(url_for("dashboard"))
 
     except Exception as e:
-        logging.error(f"Unexpected error in upload_image: {e}", exc_info=True)
-        flash(f"Error processing file: {e}", "error")
+        logging.error(f"Upload error: {e}", exc_info=True)
+        flash(f"Error: {e}", "error")
         return redirect(url_for("dashboard"))
 
     finally:
@@ -1314,8 +1439,15 @@ def upload_image():
             cursor.close()
         if conn:
             conn.close()
-        if session.get("processing", False):
-            session["processing"] = False
+        session["processing"] = False
+
+        # ✅ FIX: Always delete temp file after processing
+        try:
+            if "file_path" in locals() and os.path.exists(file_path):
+                os.remove(file_path)
+                print(f"✅ Temp file deleted: {file_path}")
+        except Exception as e:
+            print(f"⚠️ Could not delete temp file: {e}")
 
 
 @app.route("/download_file", methods=["POST"])
@@ -1369,6 +1501,9 @@ def dashboard():
             return jsonify({"error": "Unauthorized access. Please log in."}), 401
         flash("Please login first.", "warning")
         return redirect(url_for("login"))
+    if session.get("role") == "dmh":
+        return redirect(url_for("dmh_dashboard"))
+
     
 
     conn = None
@@ -1432,7 +1567,6 @@ def dashboard():
             history=formatted_history,
             api_key=api_key,
         )
-
     except mysql.connector.Error as db_err:
         logging.error(f"Database error: {db_err}", exc_info=True)
         flash(f"Database error: {db_err}", "error")
@@ -1468,42 +1602,67 @@ def dashboard():
             cursor.close()
         if conn:
             conn.close()
+@app.route("/dmh/dashboard")
+def dmh_dashboard():
+    if session.get("role") != "dmh":
+        return redirect(url_for("login"))
 
-
+    return render_template("dmh_dashboard.html")
 @app.route("/view_history")
 def view_history():
-    if "user" not in session:
-        flash("Please login first.")
+    user_id = session.get("user_id")
+    role = session.get("role")
+
+    if not user_id or role not in ["user", "dmh"]:
         return redirect(url_for("login"))
+
     try:
         conn = get_db_connection()
         cursor = conn.cursor(dictionary=True)
-        sql = "SELECT id FROM users WHERE username = %s"
-        cursor.execute(sql, (session["user"],))
-        user = cursor.fetchone()
-        if user:
-            sql_history = "SELECT * FROM extraction_history WHERE user_id = %s ORDER BY timestamp DESC"
-            cursor.execute(sql_history, (user["id"],))
-            invoice_history = cursor.fetchall()
-            formatted_history = []
-            for entry in invoice_history:
-                entry["timestamp_str"] = entry["timestamp"].strftime(
-                    "%Y-%m-%d %H:%M:%S"
-                )
-                formatted_history.append(entry)
-            cursor.close()
-            conn.close()
-            return render_template(
-                "view_history.html", invoice_history=formatted_history
-            )
-        else:
-            cursor.close()
-            conn.close()
-            flash("User not found.")
-    except Exception as e:
-        flash(f"Error: {e}")
-    return render_template("view_history.html", invoice_history=[])
 
+        cursor.execute(
+            "SELECT id FROM users WHERE username = %s",
+            (session["user"],)
+        )
+        user = cursor.fetchone()
+
+        if not user:
+            cursor.close()
+            conn.close()
+            return redirect(url_for("login"))
+
+        cursor.execute(
+            "SELECT * FROM extraction_history WHERE user_id = %s ORDER BY timestamp DESC",
+            (user["id"],)
+        )
+        invoice_history = cursor.fetchall()
+
+        formatted_history = []
+
+        for entry in invoice_history:
+            utc_time = entry["timestamp"]
+
+            if utc_time.tzinfo is None:
+                utc_time = utc_time.replace(tzinfo=timezone.utc)
+
+            ist_time = utc_time.astimezone(ZoneInfo("Asia/Kolkata"))
+
+            entry["timestamp_str"] = ist_time.strftime(
+                "%d-%m-%Y %I:%M:%S %p"
+            )
+
+            formatted_history.append(entry)
+
+        cursor.close()
+        conn.close()
+
+        return render_template(
+            "view_history.html",
+            invoice_history=formatted_history
+        )
+    except Exception as e:
+        print("Error:", e)
+        return "Something went wrong", 500
 
 @app.route("/api/extract_invoice", methods=["POST"])
 def api_extract_invoice():
@@ -1549,8 +1708,6 @@ def api_extract_invoice():
             jsonify({"success": False, "error": "Failed to extract invoice data"}),
             500,
         )
-
-
 @app.route("/generate_api_key", methods=["POST"])
 def generate_api_key():
     if "user" not in session:
@@ -1655,9 +1812,7 @@ def list_routes():
     return jsonify({"routes": routes})
 
 
-port = int(os.getenv("PORT", 8080))
-
-
+port = int(os.getenv("PORT", 8081))
 @app.route("/about")
 def about():
     return render_template("about.html")
@@ -1799,8 +1954,6 @@ def submit_query():
             ),
             200,
         )
-
-
 @app.route("/schedule", methods=["POST"])
 def schedule_demo():
     print("Received demo submission")
@@ -1846,14 +1999,13 @@ def home_logged_in():
         return redirect(url_for("index"))
     print(f"User is in session: {session['user']}")
     return render_template("home.html", logged_in=True, username=session["user"])
-
-
 @app.context_processor
 def inject_user():
     return {"logged_in": "user" in session, "username": session.get("user")}
 
+from datetime import datetime
+
+
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8080))
-    app.run(host="0.0.0.0", port=port, debug=True)
-    app.run(host="0.0.0.0", port=port, debug=True)
+     app.run(host="0.0.0.0", port=8081, debug=True)
